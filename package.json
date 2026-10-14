@@ -1,0 +1,12 @@
+{
+  "name": "neptune-light-source-checks",
+  "version": "0.21.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check:js": "node scripts/check-js.cjs"
+  }
+}
