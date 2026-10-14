@@ -1,13 +1,15 @@
-> 0.21.0 GitHub source package: dashboard features and authenticator codes are included. `.github/workflows/build.yml` runs compile checks and builds without unit tests. This is uncompiled source; see `CHANGES-0.21.0.md` and `SECURITY-REVIEW-0.21.0.md`.
+> **0.22.0 GitHub source package.** Wallet tools and authenticator codes are in Parameters. `.github/workflows/build.yml` runs compilation checks and builds without unit tests. Upload this folder’s contents at your repository root, including `.github/`, then download the compiled extension from Actions. This is uncompiled source; see `CHANGES-0.22.0.md` and `docs/SECURITY.md`.
+
+> Latest source update: **0.22.0**. Features and authenticator are integrated into Parameters. See `CHANGES-0.22.0.md` for recovery repairs, star masking, added languages and build requirements.
 
 # Escanour Neptune Wallet
 
 A private light wallet for [Neptune Cash](https://neptune.cash) as a Chrome extension, with no node to run and no change to Neptune.
 
-- **Private sync.** The wallet downloads blocks by height from any public neptune-core node, scans them locally, and keeps its own membership proofs. The server learns only which heights you asked for. It never sees an address, a key, or which coins are yours.
+- **Private full scan.** The wallet downloads blocks by height from a compatible neptune-core node, scans them locally, and keeps its own membership proofs. Full-scan requests contain heights, not addresses or keys. Optional Fast restore instead exposes receiver identifiers and coin index sets to the chosen node; its recovery screen explains this before selection.
 - **Fast start.** A new wallet starts at the current tip: no history to download.
 - **Proving on your device, in parallel.** A transaction's ProofCollection is split into independent jobs that run in separate Web Workers, each with its own wasm memory.
-- **Uses Neptune as it is.** Only existing JSON-RPC endpoints (`chain_height`, `wallet_getBlocks`, `wallet_submitTransaction`). The only patch is a small wasm-compatibility diff applied to a vendored copy of neptune-core inside this repo.
+- **Uses Neptune as it is.** Existing JSON-RPC endpoints handle block reading, submission and optional indexed recovery. A WASM compatibility patch and targeted warning cleanup are applied to a vendored copy of neptune-core inside this repo.
 
 > **Status: alpha, not yet compiled.** The code was written against neptune-core's source (commit `cc3fca9`, crates 0.19) but has not been built or run yet. Start with [docs/STATUS.md](docs/STATUS.md), which lists what to verify first. Use testnet before mainnet.
 

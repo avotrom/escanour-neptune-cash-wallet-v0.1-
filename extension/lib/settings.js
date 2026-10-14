@@ -88,7 +88,7 @@ export function validatePatch(patch) {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings');
   const extra = new Set(['watchScanMode','watchAlerts']);
   const clean = {};
-  const choices = {theme:['auto','light','dark'],language:['auto','en','fr','ar'],currency:['off','usdt','usd','eur','gbp'],addressKind:['generation','ec-hybrid'],lowMemoryProving:['auto','on','off'],watchScanMode:['private','fast']};
+  const choices = {theme:['auto','light','dark'],language:['auto','en','fr','ar','es','de','pt'],currency:['off','usdt','usd','eur','gbp'],addressKind:['generation','ec-hybrid'],lowMemoryProving:['auto','on','off'],watchScanMode:['private','fast']};
   for (const [key,value] of Object.entries(patch)) {
     if (key === 'network' || key === 'birthday' || (!Object.hasOwn(DEFAULTS,key) && !extra.has(key))) throw new Error('Unsupported setting');
     if (choices[key] && !choices[key].includes(value)) throw new Error(`Invalid ${key}`);

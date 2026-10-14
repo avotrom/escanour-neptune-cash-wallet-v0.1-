@@ -59,6 +59,6 @@ bash scripts/build.sh
 
 The existing build script fetches the pinned Neptune dependencies and builds `extension/pkg/light` and `extension/pkg/prover`. Local verification tests are retained in the working copy; testnet integration is still required before real-fund use. Load/reload `extension/` in the browser and accept the required proxy permission. A running local Tor SOCKS service is still required for Tor; none is bundled.
 
-## GitHub package
+## Verification copy
 
-This package omits Node tests and inline Rust unit-test modules. The GitHub workflow performs compile checks and builds both WASM modules without running unit tests. The previous 48-test result belongs to the separate local verification copy.
+Reported local test results belong to the separate working copy. This GitHub upload package omits Node tests and inline Rust unit-test modules, while retaining compilation checks and the WASM build.

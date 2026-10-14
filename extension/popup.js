@@ -1,18 +1,19 @@
 // Popup UI. Holds no secrets except a recovery phrase the user is looking at;
 // every action is a message to the service worker.
 
-import { t, setLanguage, applyI18n, lang } from './lib/i18n.js';
+import { t, translateText, setLanguage, applyI18n, lang } from './lib/i18n.js';
+import { initParameters, openParameterScreen, parameterScreenChanged, refreshParameters, clearParameters } from './lib/parameters.js';
+import { setAmount, setAmountsHidden, amountsHidden, clearAmountCache } from './lib/privacy.js';
 import { readAddressFromFile, readAddressFromImageBlob, cleanAddress } from './lib/qrimport.js';
 
 const $ = (id) => document.getElementById(id);
-$('openDashboard').onclick = () => chrome.tabs.create({url:chrome.runtime.getURL('hub.html')});
 let pendingApproval = null;
 function askAuthCode() {
   if(pendingApproval) return Promise.reject(new Error('Complete the current approval first'));
   return new Promise(resolve => {pendingApproval=resolve; $('authApprovalCode').value=''; $('authApproval').showModal(); $('authApprovalCode').focus();});
 }
 $('authApproval').addEventListener('close', () => {const code=$('authApproval').returnValue==='approve'?$('authApprovalCode').value.trim():null; $('authApprovalCode').value=''; const resolve=pendingApproval;pendingApproval=null;resolve?.(code);});
-const SCREENS = ['welcome', 'ready', 'setup', 'unlock', 'home', 'settings', 'contacts', 'phrase', 'servers', 'advanced', 'about', 'pcheck', 'tor', 'watch', 'claim', 'archive'];
+const SCREENS = ['welcome', 'ready', 'setup', 'unlock', 'home', 'settings', 'contacts', 'phrase', 'servers', 'advanced', 'about', 'pcheck', 'tor', 'watch', 'claim', 'archive', 'toolsNetwork','toolsScans','toolsPortfolios','toolsActivity','toolsPayments','toolsNode','toolsBackup','toolsSecurity','toolsAssistant','toolsRestore'];
 const PARAMS = new URLSearchParams(location.search);
 const IN_TAB = PARAMS.get('view') === 'tab';
 // The wallet's usual home: Chrome's side panel, full height next to the page.
@@ -36,22 +37,13 @@ let historyCache = [];
 let price = null;
 let serversNet = 'main';
 const addrCache = {}; // kind -> receiving address (one per kind and network)
-let assetsHidden = localStorage.getItem('esc.hideAssets') === 'true';
+let assetsHidden = amountsHidden();
 let lastHomeWatch = [];
-let showHiddenWatch = false;
 let hiddenWatchIds = [];
 try { localStorage.removeItem('esc.hiddenWatch'); } catch {}
-function hiddenWatchKeys() { return hiddenWatchIds; }
-function watchDisplayKey(a) { return a.id; }
-$('showHiddenWatch').onclick = () => {
-  showHiddenWatch = !showHiddenWatch;
-  $('showHiddenWatch').textContent = showHiddenWatch ? 'Hide hidden assets' : 'Show hidden assets';
-  $('showHiddenWatch').setAttribute('aria-pressed', String(showHiddenWatch));
-  renderHomeWatch(lastHomeWatch);
-};
 function applyAssetVisibility() {
-  document.body.classList.toggle('assets-hidden', assetsHidden);
-  $('hideAssets').textContent = assetsHidden ? 'Show balances' : 'Hide balances';
+  setAmountsHidden(assetsHidden);
+  $('hideAssets').textContent = translateText(assetsHidden ? 'Show balances' : 'Hide balances');
   $('hideAssets').setAttribute('aria-pressed', String(assetsHidden));
 }
 $('hideAssets').onclick = () => {
@@ -91,7 +83,9 @@ async function call(cmd, args) {
 // ------------------------------------------------------------- helpers ----
 
 function showScreen(name) {
+  parameterScreenChanged(name);
   if (['unlock', 'welcome'].includes(name)) {
+    clearParameters(); clearAmountCache();
     if (currentSheet) closeSheet();
     revealed = null; contacts = []; historyCache = []; lastHomeWatch = []; hiddenWatchIds = []; lastSummary = null; lastAvail = null; lastSend = null;
     for (const key of Object.keys(addrCache)) delete addrCache[key];
@@ -343,9 +337,8 @@ function renderHomeWatch(list) {
   ul.textContent = '';
   $('homeWatchEmpty').hidden = list.length > 0;
   $('homeWatchMore').hidden = list.length === 0;
-  const hidden = hiddenWatchKeys();
   for (const a of list) {
-    if (!showHiddenWatch && hidden.includes(watchDisplayKey(a))) continue;
+
     const li = document.createElement('li');
     const btn = document.createElement('button');
     btn.className = 'hw-row';
@@ -373,7 +366,7 @@ function renderHomeWatch(list) {
     const amt = document.createElement('span');
     amt.className = 'hw-amt';
     const v = document.createElement('b');
-    v.textContent = `${fmtAmt(a.unspent ?? a.received)} NPT`;
+    setAmount(v,`${fmtAmt(a.unspent ?? a.received)} NPT`);
     const k = document.createElement('small');
     k.textContent = a.unspent != null ? t('watch.unspent') : t('watch.received');
     amt.append(v, k);
@@ -592,7 +585,7 @@ $('setupGo').onclick = async () => {
   if (replacing && !confirm(t('setup.confirmReplace'))) return;
   // A restore scans the whole chain, so every coin of this seed is found
   // without asking when the wallet was created. A new wallet starts at the tip.
-  const from = setupMode === 'restore' ? { birthday: 1 } : {};
+  const from = setupMode === 'restore' ? { birthday: 0 } : {};
   if (setupMode === 'restore') {
     from.restoreMode = document.querySelector('input[name="restoreMode"]:checked')?.value || 'private';
     if (from.restoreMode === 'node') {
@@ -710,6 +703,7 @@ function renderStatus(st) {
 }
 
 $('statusBtn').onclick = async () => {
+  if(app?.status?.fastFailed) return openSub('toolsRestore');
   if (app?.status?.error === 'NEED_SERVER') return openServers(app.settings.network);
   renderStatus({ ...(app?.status || {}), error: null, serverOk: undefined, height: null });
   try {
@@ -735,11 +729,11 @@ async function renderBalance(given) {
     const shown = k.generation != null && k.ec_hybrid != null
       ? fromUnits(cut8(toUnits(k.generation)) + cut8(toUnits(k.ec_hybrid)))
       : fmtAmt(s.available);
-    $('balAvail').textContent = shown;
+    setAmount($('balAvail'),shown);
     lastAvail = s.available;
     renderExtra();
     for (const [kind, v] of [['generation', k.generation], ['ec-hybrid', k.ec_hybrid]]) {
-      $(`kBal-${kind}`).textContent = fmtAmt(v);
+      setAmount($(`kBal-${kind}`),fmtAmt(v));
       document.querySelector(`.acard[data-kind="${kind}"]`).classList.toggle('has', Number(v) > 0);
     }
     $('kChangeRow').hidden = true; // change counts for the address that paid
@@ -766,12 +760,13 @@ function renderExtra() {
   } else if (Number(s.pending_out) > 0) {
     pills.push(['back', t('pill.returning', { c: fmtAmt(s.pending_out) })]);
   }
-  if (Number(s.timelocked) > 0) pills.push(['', t('pill.locked', { n: fmtAmt(s.timelocked) })]);
+  if (Number(s.timelocked) > 0) pills.push(['money', t('pill.locked', { n: fmtAmt(s.timelocked) })]);
   const box = $('balExtra');
   box.replaceChildren(...pills.map(([kind, text]) => {
     const el = document.createElement('span');
     el.className = `bpill ${kind}`.trim();
-    el.textContent = text;
+    if(['out','back','money'].includes(kind))setAmount(el,text);else el.textContent=text;
+    if(st.fastFailed && kind==='warn'){el.setAttribute('role','button');el.tabIndex=0;el.onclick=()=>openSub('toolsRestore');el.onkeydown=e=>{if(e.key==='Enter')el.click();};}
     return el;
   }));
 }
@@ -913,7 +908,7 @@ function openPrivacy() {
   for (const c of [...p.coins].sort((a, b) => hiddenAmong(a) - hiddenAmong(b))) {
     const li = document.createElement('li');
     const a = document.createElement('b');
-    a.textContent = `${fmtAmt(c.amount)} NPT`;
+    setAmount(a,`${fmtAmt(c.amount)} NPT`);
     const h = document.createElement('span');
     h.textContent = c.exact_possible != null
       ? t('pv.coinExact', { n: fmtNum(hiddenAmong(c)) })
@@ -1057,7 +1052,7 @@ function renderFiat() {
   }
   $('market').hidden = false;
   $('fiat').hidden = false;
-  $('fiatVal').textContent = `≈ ${fmtMoney(Number(lastSummary.available) * p, cur)}`;
+  setAmount($('fiatVal'),`≈ ${fmtMoney(Number(lastSummary.available) * p, cur)}`);
   $('unitPrice').textContent = t('price.one', { v: fmtMoney(p, cur, unitDigits(p)) });
   $('fiat').title = '';
   const chg = price.change24h;
@@ -1153,11 +1148,11 @@ function txRow(e, i = 0) {
   const amt = document.createElement('span');
   amt.className = 'tx-amt';
   const v = document.createElement('span');
-  v.textContent = `${kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)}`;
+  setAmount(v,`${kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)}`);
   amt.append(v);
   if (e.fee) {
     const f = document.createElement('small');
-    f.textContent = t('tx.fee', { n: fmtAmt(e.fee) });
+    setAmount(f,t('tx.fee', { n: fmtAmt(e.fee) }));
     amt.append(f);
   }
 
@@ -1206,7 +1201,7 @@ $('seeAll').onclick = openHistory;
 
 function showTx(e) {
   $('txTitle').textContent = e.kind === 'received' ? t('tx.received') : e.kind === 'sent' ? t('tx.sent') : t('tx.elsewhere');
-  $('txAmount').textContent = `${e.kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)} NPT`;
+  setAmount($('txAmount'),`${e.kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)} NPT`);
   const statusText = e.status === 'pending' ? t('tx.waiting') : e.status === 'expired' ? t('tx.expired') : t('tx.confirmed');
   const rows = [
     [t('tx.status'), statusText],
@@ -1227,7 +1222,7 @@ function showTx(e) {
     const dt = document.createElement('dt');
     dt.textContent = k;
     const dd = document.createElement('dd');
-    dd.textContent = v;
+    if(/ NPT$/.test(String(v)))setAmount(dd,v);else dd.textContent=v;
     if (cls) dd.className = cls;
     dl.append(dt, dd);
   }
@@ -1351,7 +1346,7 @@ function updateAvailHint() {
   const s = lastSummary;
   if (!s) return;
   const v = fromKind === 'generation' ? s.by_kind?.generation : fromKind === 'ec-hybrid' ? s.by_kind?.ec_hybrid : s.available;
-  $('availHint').textContent = t('send.available', { n: fmtAmt(v) });
+  setAmount($('availHint'),t('send.available', { n: fmtAmt(v) }));
 }
 
 $('goSend').onclick = openSend;
@@ -1613,7 +1608,7 @@ function renderSendCard(send) {
   }
   card.hidden = false;
   card.dataset.state = send.status;
-  $('scTitle').textContent = t('banner.sending', { n: send.amount });
+  setAmount($('scTitle'),t('banner.sending', { n: send.amount }));
   $('scStep').textContent =
     send.status === 'proving' && send.jobCount ? t('pg.proveShort', { a: send.jobsDone || 0, b: send.jobCount }) : t(STEP_LABEL[send.status] || 'pg.sending');
   $('scBar').style.width = `${Math.round(progressPct(send))}%`;
@@ -1942,6 +1937,7 @@ function refreshOpenScreen() {
   if (refreshTimer) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
+    refreshParameters();
     if (!$('v-home').hidden) refreshHome();
     if (!$('v-archive').hidden) renderArchive().catch(() => {});
     if (!$('v-watch').hidden) renderWatch().catch(() => {});
@@ -2017,7 +2013,7 @@ function watchCard(a, height) {
     const l = document.createElement('small');
     l.textContent = label;
     const v = document.createElement('b');
-    v.textContent = value;
+    setAmount(v,value);
     if (dim) v.className = 'dim';
     c.append(l, v);
     return c;
@@ -2042,7 +2038,7 @@ function watchCard(a, height) {
   for (const c of a.coins.slice(0, 6)) {
     const li = document.createElement('li');
     const amt = document.createElement('b');
-    amt.textContent = `${fmtAmt(c.amount)} NPT`;
+    setAmount(amt,`${fmtAmt(c.amount)} NPT`);
     const sub = document.createElement('small');
     const bits = [c.received_ms ? fmtDate(c.received_ms) : t('watch.coinBlock', { h: fmtNum(c.received_height) })];
     if (c.timelocked_now && c.release_ms) bits.push(t('watch.coinLocked', { d: new Date(c.release_ms).toLocaleDateString(lang()) }));
@@ -2067,15 +2063,7 @@ function watchCard(a, height) {
       busy(rm, false);
     }
   };
-  const hide = document.createElement('button');
-  hide.className = 'btn plain';
-  const hiddenKey = watchDisplayKey(a);
-  hide.textContent = hiddenWatchKeys().includes(hiddenKey) ? 'Show asset on home' : 'Hide asset on home';
-  hide.onclick = () => {
-    busy(hide,true);
-    call('watchSetHidden',{id:a.id,hidden:!hiddenWatchIds.includes(hiddenKey)}).then(()=>renderWatch()).catch(e=>toast(String(e.message||e))).finally(()=>busy(hide,false));
-  };
-  card.append(head, nums, meta, coins, hide, rm);
+  card.append(head, nums, meta, coins, rm);
   return card;
 }
 
@@ -2215,7 +2203,7 @@ async function renderWaiting() {
     const li = document.createElement('li');
     const txt = document.createElement('span');
     const b = document.createElement('b');
-    b.textContent = `${fmtAmt(c.amount)} NPT`;
+    setAmount(b,`${fmtAmt(c.amount)} NPT`);
     const sm = document.createElement('small');
     sm.textContent = c.release_ms ? t('claim.lock', { d: new Date(c.release_ms).toLocaleDateString(lang()) }) : t('claim.noLock');
     txt.append(b, sm);
@@ -2250,7 +2238,7 @@ $('claimRead').onclick = async () => {
   try {
     const c = await call('claimCheck', { text });
     claimShown = text;
-    $('claimAmount').textContent = `${fmtAmt(c.amount)} NPT`;
+    setAmount($('claimAmount'),`${fmtAmt(c.amount)} NPT`);
     $('claimLock').textContent = c.release_ms ? t('claim.lock', { d: new Date(c.release_ms).toLocaleDateString(lang()) }) : t('claim.noLock');
     $('claimTo').textContent = t('claim.to', { k: c.key_kind === 'change' ? t('kind.change') : kindLabel(c.key_kind) });
     const st = { new: t('claim.statusNew'), waiting: t('claim.statusWaiting'), owned: t('claim.statusOwned') }[c.status] || '';
@@ -2760,7 +2748,7 @@ for (const b of document.querySelectorAll('[data-go]')) b.onclick = () => openSu
 async function openServers(net) {
   if (!app?.settings) app = await call('state');
   serversNet = net || app.settings.network;
-  if (serversNet === 'testnet-mock') serversNet = 'testnet';
+
   fillServers();
   showScreen('servers');
 }
@@ -2784,6 +2772,7 @@ for (const b of document.querySelectorAll('#srvNet .seg-btn')) {
 }
 
 function openSub(name) {
+  if(name.startsWith('tools')) return openParameterScreen(name);
   const s = app.settings;
   if (name === 'servers') return openServers(s.network);
   if (name === 'pcheck') return openPcheck();
@@ -2890,7 +2879,8 @@ async function showServerChecks(url) {
       const want = serversNet === 'main' ? 'main' : 'testnet';
       add(info.network.startsWith(want) ? 'ok' : 'bad', t('node.net', { n: info.network }));
     }
-    add(info.fastRestore ? 'ok' : 'info', info.fastRestore ? t('node.fastYes') : t('node.fastNo'));
+    add(info.fastRestore===true?'ok':'info', info.fastRestore===true?t('node.fastYes'):info.fastRestore===false?t('node.fastNo'):translateText('Fast restore support is not confirmed.'));
+    for(const capability of Object.values(info.fastCapabilities||{}))if(capability.error)add('info',capability.error);
     add('info', t('node.provingFull'));
     return info;
   } catch (e) {
@@ -3047,6 +3037,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
+initParameters({call,showScreen,toast,locked:()=>boot(),download:saveText,formatAmount:fmtAmt,openServers:()=>openSub('servers'),restoreAnother:()=>startSetup('restore',true)});
 boot().catch((e) => {
   showScreen('welcome');
   toast(String(e.message || e));

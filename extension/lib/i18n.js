@@ -1,3 +1,4 @@
+import { ADDITIONAL, PHRASES } from './languages.js';
 // Interface text in English, French and Arabic.
 //
 // Static text: elements carry data-i18n (text), data-i18n-ph (placeholder) or
@@ -2135,7 +2136,10 @@ const V20 = {
 };
 for (const l of Object.keys(V20)) Object.assign(STRINGS[l], V20[l]);
 
+for(const [code,values] of Object.entries(ADDITIONAL))STRINGS[code]=values;
+STRINGS.en['set.title']='Parameters';
 export const LANGUAGES = Object.keys(STRINGS);
+const englishKeys=new Map(Object.entries(STRINGS.en).map(([key,value])=>[value,key]));
 let current = 'en';
 
 function detect() {
@@ -2159,7 +2163,14 @@ export function t(key, vars) {
   return vars ? s.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? '')) : s;
 }
 
+export function translateText(text, vars) {
+  const key=englishKeys.get(text);
+  const value=PHRASES[current]?.[text] ?? (key?STRINGS[current][key]:undefined) ?? text;
+  return vars?value.replace(/\{(\w+)\}/g,(_,k)=>String(vars[k]??'')):value;
+}
+
 export function applyI18n(root) {
+  for(const el of root.querySelectorAll('[data-i18n-text]'))el.textContent=translateText(el.dataset.i18nText);
   for (const el of root.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
   for (const el of root.querySelectorAll('[data-i18n-ph]')) el.placeholder = t(el.dataset.i18nPh);
   for (const el of root.querySelectorAll('[data-i18n-aria]')) {

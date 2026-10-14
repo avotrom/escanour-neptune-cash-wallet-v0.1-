@@ -41,6 +41,6 @@ Keep a backup of the original build and recovery material. This source update ha
 - Indexed fast restore for external watch-only keys is not implemented by the existing wallet engine. Fast track accelerates block download concurrency only.
 - This addresses the identified paths; it is not a claim that all wallet bugs have been eliminated.
 
-## GitHub package
+## Verification copy
 
-This package omits Node tests and inline Rust unit-test modules. The GitHub workflow performs compile checks and builds both WASM modules without running unit tests. The previous 48-test result belongs to the separate local verification copy.
+Reported local test results belong to the separate working copy. This GitHub upload package omits Node tests and inline Rust unit-test modules, while retaining compilation checks and the WASM build.

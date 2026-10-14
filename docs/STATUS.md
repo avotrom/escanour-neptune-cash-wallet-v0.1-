@@ -1,6 +1,6 @@
 # Status
 
-**Alpha. Not yet compiled.** Every Neptune API call in `light-core` was checked against neptune-core's source at commit `cc3fca9` (crates 0.19.0). Nothing has been built or run, because the environment where this was written could not reach crates.io. Expect a round of compiler fixes before the first build succeeds.
+**Alpha source update 0.22.0.** The local JavaScript suite passes 59 checks, including mocked browser/node flows and security checks. Rust/WASM compilation of this update remains unverified because the local toolchain is unavailable. Neptune dependencies remain pinned at commit `cc3fca9` (crates 0.19.0). GitHub compilation and a testnet browser run are still required; this source ZIP does not contain compiled WASM modules.
 
 ## First-build checklist
 
@@ -60,7 +60,7 @@ Work through these in order. Each step depends on the one before.
 | Download an address as a QR picture (PNG), or as a text file when too long for a QR code | written |
 | Import a recipient from a QR picture or text file (pick, drop or paste); reader in wasm (`rqrr`) with the browser's BarcodeDetector first | written |
 | Local-currency value (USDT, USD, EUR, GBP) from CoinGecko, can be turned off | written |
-| Interface in English, French and Arabic (right-to-left); theme Auto / Light / Dark | written |
+| Interface in English, French and Arabic (right-to-left), plus Spanish, German and Portuguese; theme Auto / Light / Dark | core labels and Parameters controls implemented; some secondary explanations fall back to English |
 | Broadcast from the offscreen page; interrupted sends resume (fixes "stuck at Broadcasting") | written |
 | Pending payment shown with the change that comes back; expired payments marked | written |
 | Recipient kind shown before sending; secret keys refused as recipients; "Pay from" one address kind | written |
@@ -77,6 +77,11 @@ Work through these in order. Each step depends on the one before.
 | Self-check before broadcast: every proof verified against the claims neptune-consensus builds (`ProofCollection::*_claim`) | written |
 | Restore scans the whole chain from block 1 (no date to choose); continuous chunked scan with progress | written, tested with a simulated chain |
 | Minimum fee raised to 0.02 NPT so proof upgraders (min 0.01 after their 60 % share) take the transaction | written |
+| Network/block lookup, scan controls, paired portfolios, contact feed, payment tracker and node health | integrated into Parameters; JavaScript flow checks pass |
+| Encrypted contact/watch backup and local read-only helper | implemented; backup encryption and import checks pass |
+| Authenticator app codes and one-use recovery codes | implemented; RFC TOTP vectors, replay/cooldown and message-boundary checks pass |
+| Restore the same wallet with explicit retry and smaller adaptive indexed requests | JavaScript flow checks pass; typed Rust probes and live-node recovery await compiled validation |
+| Literal `**` masking for balances and history amounts | implemented; display behavior checked in local harness |
 
 ## Known gaps
 

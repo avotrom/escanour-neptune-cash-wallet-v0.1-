@@ -81,3 +81,8 @@
 - Approved proof/broadcast work may continue in an offscreen document after the UI locks. Locking prevents new wallet approvals; it does not revoke an already approved network submission. Reset/replacement is blocked while active payment work exists.
 - Portable contact/watch backups use password-derived AES-GCM with a new random salt and nonce. They contain sensitive viewing keys, but no wallet seed or authenticator secret. Losing the backup password makes the file unrecoverable through this tool.
 - Source review and mocked runtime tests are not a certification. Rust/WASM compilation, live-node integration, consensus validation, browser installation, and traffic-capture checks are still required before real-fund use.
+
+
+## 0.22.0 interface/recovery update
+
+Features are integrated into the wallet Parameters screens; the separate dashboard page is removed. Individual hide controls have been replaced in the UI by literal-star amount masking. Recovery plans and original error details are encrypted at rest. Fast restore uses smaller/adaptive requests while retaining all existing proof checks. Capability probes contain no wallet flags or coin index sets. The live node and compiled Rust/WASM checks remain outstanding.

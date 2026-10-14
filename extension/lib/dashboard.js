@@ -1,7 +1,7 @@
 // Pure presentation models. All monetary aggregation uses integer units.
-const SCALE = 10n ** 12n;
-export function units(value) { const text=String(value??'0'); if(!/^\d+(\.\d{1,12})?$/.test(text))throw new Error('Invalid amount'); const [whole,fraction='']=text.split('.');return BigInt(whole)*SCALE+BigInt(fraction.padEnd(12,'0')); }
-export function amount(value) { const fraction=(value%SCALE).toString().padStart(12,'0').replace(/0+$/,'');return `${value/SCALE}${fraction?'.'+fraction:''}`; }
+const SCALE = 10n ** 64n;
+export function units(value) { const text=String(value??'0'); if(!/^\d+(\.\d{1,64})?$/.test(text))throw new Error('Invalid amount'); const [whole,fraction='']=text.split('.');return BigInt(whole)*SCALE+BigInt(fraction.padEnd(64,'0')); }
+export function amount(value) { const fraction=(value%SCALE).toString().padStart(64,'0').replace(/0+$/,'');return `${value/SCALE}${fraction?'.'+fraction:''}`; }
 export function portfolios(watch,contacts,height) {
   const groups=new Map();
   for(const w of watch){
@@ -57,5 +57,5 @@ export function trustedMessage(sender,runtimeId,message) {
   let url;try{url=new URL(sender.url);}catch{return false;}
   if(url.protocol!=='chrome-extension:'||url.hostname!==runtimeId)return false;
   if(message.type)return url.pathname==='/offscreen.html'&&['proved','submitted','proveProgress','proveFailed'].includes(message.type);
-  return ['/popup.html','/hub.html'].includes(url.pathname)&&typeof message.cmd==='string';
+  return ['/popup.html'].includes(url.pathname)&&typeof message.cmd==='string';
 }

@@ -91,6 +91,20 @@ pub fn max_blocks_per_call() -> f64 {
     rpc::MAX_BLOCKS_PER_CALL as f64
 }
 
+/// Fast-restore probes use the same typed parameter encodings as recovery.
+#[wasm_bindgen(js_name = fastProbeRequests)]
+pub fn fast_probe_requests(id: f64) -> Result<JsValue, JsError> {
+    let (flags, proofs) = light_core::fast::capability_requests(id as u64).map_err(js_err)?;
+    #[derive(Serialize)]
+    struct Probes { flags: String, proofs: String }
+    to_js(&Probes { flags, proofs })
+}
+
+#[wasm_bindgen(js_name = validateFastProbeResponse)]
+pub fn validate_fast_probe_response(kind: &str, body: &str) -> Result<(), JsError> {
+    light_core::fast::validate_capability_response(kind, body).map_err(js_err)
+}
+
 // ------------------------------- wallet -------------------------------------
 
 #[wasm_bindgen]
@@ -823,6 +837,11 @@ impl FastRestoreJs {
         FastRestoreJs {
             inner: light_core::fast::FastRestore::new(),
         }
+    }
+
+    #[wasm_bindgen(js_name = setChunkSize)]
+    pub fn set_chunk_size(&mut self, size: u32) {
+        self.inner.set_chunk_size(size as usize);
     }
 
     /// The next heights-by-flags request, or `undefined` when done.
