@@ -44,7 +44,7 @@ export const DEFAULTS = {
   priceLookup: true,
   // Chrome notifications: payment sent, received, confirmed, failed.
   notifications: true,
-  notificationDetails: false,
+  hideAssets: false,
 };
 
 /** Settings written by versions before 0.3 kept one server pair for the wallet's network. */
@@ -81,28 +81,4 @@ export function workerCount(setting, deviceMemoryGb, cores) {
   const byMemory = Math.floor((deviceMemoryGb || 4) / 2);
   const byCores = Math.max(1, (cores || 2) - 1);
   return Math.max(1, Math.min(4, byMemory, byCores));
-}
-
-/** Validate UI settings before they reach persistent storage. */
-export function validatePatch(patch) {
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid settings');
-  const extra = new Set(['watchScanMode','watchAlerts']);
-  const clean = {};
-  const choices = {theme:['auto','light','dark'],language:['auto','en','fr','ar','es','de','pt'],currency:['off','usdt','usd','eur','gbp'],addressKind:['generation','ec-hybrid'],lowMemoryProving:['auto','on','off'],watchScanMode:['private','fast']};
-  for (const [key,value] of Object.entries(patch)) {
-    if (key === 'network' || key === 'birthday' || (!Object.hasOwn(DEFAULTS,key) && !extra.has(key))) throw new Error('Unsupported setting');
-    if (choices[key] && !choices[key].includes(value)) throw new Error(`Invalid ${key}`);
-    if (['tor','exactPrivacy','localArchive','priceLookup','notifications','waitForFreshBlock','watchAlerts','notificationDetails'].includes(key) && typeof value !== 'boolean') throw new Error(`Invalid ${key}`);
-    if (key === 'torPort' && (!Number.isSafeInteger(value) || value < 1 || value > 65535)) throw new Error('Invalid Tor port');
-    if (key === 'autoLockMinutes' && (!Number.isFinite(value) || value < 1 || value > 240)) throw new Error('Auto-lock must be 1–240 minutes');
-    if (key === 'workers' && value !== 'auto' && (!Number.isSafeInteger(Number(value)) || Number(value)<1 || Number(value)>16)) throw new Error('Invalid worker count');
-    if (key === 'servers') {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid servers');
-      for (const [network,server] of Object.entries(value)) {
-        if (!NETWORKS.includes(network) || !server || typeof server!=='object' || Object.keys(server).some(k=>!['sync','broadcast'].includes(k)) || Object.values(server).some(v=>typeof v!=='string'||v.length>2048)) throw new Error('Invalid server settings');
-      }
-    }
-    clean[key]=value;
-  }
-  return clean;
 }

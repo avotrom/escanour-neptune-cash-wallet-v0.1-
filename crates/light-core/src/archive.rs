@@ -550,3 +550,113 @@ impl Archive {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use neptune_mutator_set::commit;
+
+    use super::*;
+
+    fn digest(n: u64) -> Digest {
+        Tip5::hash(&neptune_wallet::twenty_first::math::b_field_element::BFieldElement::new(n))
+    }
+
+    /// An archive driven by random-looking additions and removals, checked
+    /// against the plain accumulator and against proofs kept up to date the
+    /// way the wallet keeps its own.
+    #[test]
+    fn archive_matches_accumulator_and_restores_proofs() {
+        let mut a = Archive {
+            network: Network::Main,
+            height: 0,
+            tip_hash: Digest::default(),
+            msa: MutatorSetAccumulator::default(),
+            leaves: vec![],
+            chunks: vec![],
+            chunk_hashes: vec![],
+            block_ends: vec![0],
+            expect: None,
+            dirty_leaf_pages: BTreeSet::new(),
+            dirty_chunk_pages: BTreeSet::new(),
+        };
+        let mut msa = MutatorSetAccumulator::default();
+        // (item, sender randomness, receiver preimage, proof, spent)
+        let mut coins: Vec<(Digest, Digest, Digest, MsMembershipProof, bool)> = vec![];
+
+        // Enough additions for the window to slide many times (batch = 8).
+        for n in 0..600u64 {
+            let (item, sr, rp) = (digest(3 * n), digest(3 * n + 1), digest(3 * n + 2));
+            let record = commit(item, sr, rp.hash());
+            {
+                let items: Vec<Digest> = coins.iter().map(|c| c.0).collect();
+                let mut proofs: Vec<&mut MsMembershipProof> =
+                    coins.iter_mut().map(|c| &mut c.3).collect();
+                MsMembershipProof::batch_update_from_addition(&mut proofs, &items, &msa, &record)
+                    .unwrap();
+            }
+            coins.push((item, sr, rp, msa.prove(item, sr, rp), false));
+            msa.add(&record);
+            a.add(&record).unwrap();
+
+            // Every 3rd step, spend an old coin.
+            if n % 3 == 2 {
+                let victim = (n as usize * 7) % coins.len();
+                if !coins[victim].4 {
+                    let removal = msa.drop(coins[victim].0, &coins[victim].3);
+                    coins[victim].4 = true;
+                    {
+                        let mut proofs: Vec<&mut MsMembershipProof> = coins
+                            .iter_mut()
+                            .filter(|c| !c.4)
+                            .map(|c| &mut c.3)
+                            .collect();
+                        MsMembershipProof::batch_update_from_remove(&mut proofs, &removal).unwrap();
+                    }
+                    a.remove(&removal).unwrap();
+                    msa.remove(&removal);
+                }
+            }
+            assert_eq!(a.msa.hash(), msa.hash(), "after step {n}");
+        }
+        a.block_ends = vec![a.leaves.len() as u64];
+        a.check().unwrap();
+
+        for (i, (item, sr, rp, proof, spent)) in coins.iter().enumerate() {
+            let set = AbsoluteIndexSet::compute(*item, *sr, *rp, i as u64);
+            assert_eq!(a.was_spent(&set), *spent, "spent flag of coin {i}");
+            match a.restore(*item, *sr, *rp, i as u64) {
+                Ok(restored) => {
+                    assert!(!spent, "a spent coin got a proof");
+                    assert!(msa.verify(*item, &restored));
+                    // An MMR path is unique: it must equal the one kept up to date.
+                    assert_eq!(restored.auth_path_aocl, proof.auth_path_aocl, "coin {i}");
+                }
+                Err(_) => assert!(spent, "coin {i} could not be restored"),
+            }
+            let record = commit(*item, *sr, rp.hash());
+            assert_eq!(a.locate(&record).map(|x| x.0), Some(i as u64));
+        }
+
+        // Round trip through storage.
+        let meta = a.meta_bytes().unwrap();
+        let mut b = Archive::from_meta(&meta, Network::Main).unwrap();
+        for p in 0..a.leaf_pages() {
+            b.load_leaf_page(p, &a.leaf_page(p)).unwrap();
+        }
+        for p in 0..a.chunk_pages() {
+            b.load_chunk_page(p, &a.chunk_page(p).unwrap()).unwrap();
+        }
+        b.finish_load().unwrap();
+        b.check().unwrap();
+        assert_eq!(b.msa.hash(), msa.hash());
+    }
+
+    #[test]
+    fn genesis_archive_matches_genesis_block() {
+        let a = Archive::new(Network::Main).unwrap();
+        assert_eq!(a.height(), 0);
+        assert_eq!(a.tip_hash(), Block::genesis(Network::Main).hash());
+        a.check().unwrap();
+        assert_eq!(a.block_leaves(0), Some((0, a.num_leaves() - 1)));
+    }
+}

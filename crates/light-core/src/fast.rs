@@ -122,7 +122,6 @@ pub struct FastRestore {
     /// Coins already spent at the snapshot, with the spending block once known.
     spent: BTreeMap<u64, Option<u64>>,
     snapshot: Option<Snapshot>,
-    chunk_size: usize,
     /// Hash and time of the blocks where coins were spent.
     spend_blocks: BTreeMap<u64, (String, u64)>,
 }
@@ -282,17 +281,7 @@ impl FastRestore {
 
     /// Number of `wallet_restoreMembershipProof` calls needed.
     pub fn restore_chunks(&self) -> usize {
-        self.found.len().div_ceil(self.chunk_size())
-    }
-
-    fn chunk_size(&self) -> usize {
-        if self.chunk_size == 0 { MAX_INDEX_SETS_PER_CALL } else { self.chunk_size }
-    }
-
-    /// Adapt to older/restricted nodes without changing proof validation.
-    pub fn set_chunk_size(&mut self, size: usize) {
-        self.chunk_size = size.clamp(1, MAX_INDEX_SETS_PER_CALL);
-        self.reset_proofs();
+        self.found.len().div_ceil(MAX_INDEX_SETS_PER_CALL)
     }
 
     /// Forget proofs from an earlier attempt (the node's tip moved between
@@ -306,8 +295,8 @@ impl FastRestore {
     fn chunk(&self, chunk: usize) -> Vec<&Found> {
         self.found
             .values()
-            .skip(chunk * self.chunk_size())
-            .take(self.chunk_size())
+            .skip(chunk * MAX_INDEX_SETS_PER_CALL)
+            .take(MAX_INDEX_SETS_PER_CALL)
             .collect()
     }
 
@@ -515,25 +504,4 @@ impl FastRestore {
         state.next_ec_hybrid_index = counts.2;
         Ok((state, events.into_values().collect()))
     }
-}
-
-/// Empty capability probes using the exact node request encodings.
-/// No wallet receiver identifiers or index sets are disclosed.
-pub fn capability_requests(first_id: u64) -> Result<(String, String)> {
-    let flags = serde_json::to_value(BlockHeightsByFlagsRequest { announcement_flags: vec![] })?;
-    let proofs = serde_json::to_value(RestoreMembershipProofRequest { absolute_index_sets: vec![] })?;
-    Ok((request_body(first_id, METHOD_HEIGHTS_BY_FLAGS, flags), request_body(first_id + 1, METHOD_RESTORE_MEMBERSHIP_PROOF, proofs)))
-}
-
-/// Validate that capability replies use the same response schema as restore.
-pub fn validate_capability_response(kind: &str, body: &str) -> Result<()> {
-    match kind {
-        "flags" => { let _: BlockHeightsByFlagsResponse = result_from_envelope(body)?; }
-        "proofs" => {
-            let reply: RestoreMembershipProofResponse = result_from_envelope(body)?;
-            ensure!(reply.snapshot.membership_proofs.is_empty(), "empty capability probe returned unexpected proofs");
-        }
-        _ => return Err(anyhow!("unknown fast-restore capability")),
-    }
-    Ok(())
 }

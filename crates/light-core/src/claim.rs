@@ -559,3 +559,76 @@ pub fn register_premine(state: &mut WalletState, keys: &Keys, indices: Option<&[
     }
     Ok(n)
 }
+
+#[cfg(test)]
+mod tests {
+    use neptune_consensus::transaction::utxo::Utxo;
+    use neptune_consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+    use neptune_mutator_set::commit;
+    use neptune_primitives::timestamp::Timestamp;
+    use neptune_wallet::twenty_first::math::b_field_element::BFieldElement;
+    use neptune_wallet::utxo_notification::UtxoNotificationPayload;
+
+    use super::*;
+
+    fn keys(seed: u8) -> Keys {
+        let phrase = Keys::phrase_from_entropy(&[seed; 24]).unwrap();
+        Keys::from_phrase(&phrase, Network::Main).unwrap()
+    }
+
+    #[test]
+    fn genesis_state_is_consistent() {
+        let k = keys(5);
+        let st = genesis_state(&k).unwrap();
+        assert_eq!(st.height, 0);
+        assert_eq!(st.tip_hash, Block::genesis(Network::Main).hash());
+        // A random wallet owns no premine.
+        assert!(st.utxos.is_empty());
+        assert!(premine_coins(&k).unwrap().is_empty());
+        // And survives a round trip through bytes.
+        let again = WalletState::from_bytes(&st.to_bytes().unwrap()).unwrap();
+        assert_eq!(again.msa.hash(), st.msa.hash());
+    }
+
+    #[test]
+    fn off_chain_notification_round_trip() {
+        let k = keys(7);
+        let mut st = genesis_state(&k).unwrap();
+        for key_ref in [KeyRef::EcHybrid(0), KeyRef::Generation(0)] {
+            let address = k.address(key_ref);
+            let release = Timestamp::millis(4_102_444_800_000); // year 2100
+            let utxo = Utxo::new_native_currency(
+                address.lock_script_hash(),
+                NativeCurrencyAmount::coins(12),
+            )
+            .with_time_lock(release);
+            let sr = Tip5::hash(&BFieldElement::new(99));
+            let text = address
+                .private_notification(UtxoNotificationPayload::new(utxo.clone(), sr), Network::Main);
+
+            let e = decode_notification(&text, &k, &st).unwrap();
+            assert_eq!(e.key, key_ref);
+            assert_eq!(Tip5::hash(&e.utxo), Tip5::hash(&utxo));
+            assert_eq!(e.addition_record, commit(Tip5::hash(&utxo), sr, address.privacy_digest()));
+            let v = claim_view(&st, &e);
+            assert_eq!(v.release_ms, Some(release.to_millis()));
+            assert_eq!(v.status, ClaimStatus::New);
+            assert_eq!(register(&mut st, e.clone()), ClaimStatus::New);
+            assert_eq!(register(&mut st, e.clone()), ClaimStatus::Waiting);
+
+            // Another wallet cannot read it.
+            let other = keys(8);
+            assert!(decode_notification(&text, &other, &genesis_state(&other).unwrap()).is_err());
+            // Nor can another network's decoder.
+            assert!(decode_notification(&text, &keys_on(7, Network::Testnet(0)), &st).is_err());
+
+            assert!(unregister(&mut st, &e.addition_record.canonical_commitment.to_hex()));
+        }
+        assert!(st.expected.is_empty());
+    }
+
+    fn keys_on(seed: u8, network: Network) -> Keys {
+        let phrase = Keys::phrase_from_entropy(&[seed; 24]).unwrap();
+        Keys::from_phrase(&phrase, network).unwrap()
+    }
+}

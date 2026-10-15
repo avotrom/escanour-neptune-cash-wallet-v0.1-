@@ -389,3 +389,82 @@ impl WalletState {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use neptune_wallet::twenty_first::math::b_field_element::BFieldElement;
+
+    use super::*;
+
+    /// What version 2 wrote, field for field.
+    #[derive(Serialize)]
+    struct V2Coin {
+        utxo: Utxo,
+        sender_randomness: Digest,
+        receiver_preimage: Digest,
+        key: KeyRef,
+        membership_proof: MsMembershipProof,
+        received_height: u64,
+        spent_height: Option<u64>,
+        reserved_by: Option<Reservation>,
+    }
+
+    #[derive(Serialize)]
+    struct V2 {
+        version: u32,
+        network: Network,
+        height: u64,
+        tip_hash: Digest,
+        tip_timestamp_ms: u64,
+        msa: MutatorSetAccumulator,
+        lustration_status: Option<LustrationStatus>,
+        next_generation_index: u64,
+        next_symmetric_index: u64,
+        utxos: Vec<V2Coin>,
+        next_ec_hybrid_index: u64,
+    }
+
+    #[test]
+    fn version_2_state_is_read_and_upgraded() {
+        let d = |n: u64| Tip5::hash(&BFieldElement::new(n));
+        let msa = MutatorSetAccumulator::default();
+        let utxo = Utxo::new_native_currency(d(1), NativeCurrencyAmount::coins(5));
+        let proof = msa.prove(Tip5::hash(&utxo), d(2), d(3));
+        let old = V2 {
+            version: 2,
+            network: Network::Main,
+            height: 42,
+            tip_hash: d(4),
+            tip_timestamp_ms: 7,
+            msa: msa.clone(),
+            lustration_status: None,
+            next_generation_index: 3,
+            next_symmetric_index: 4,
+            utxos: vec![V2Coin {
+                utxo,
+                sender_randomness: d(2),
+                receiver_preimage: d(3),
+                key: KeyRef::EcHybrid(1),
+                membership_proof: proof,
+                received_height: 40,
+                spent_height: None,
+                reserved_by: None,
+            }],
+            next_ec_hybrid_index: 2,
+        };
+        let bytes = bincode::serialize(&old).unwrap();
+        let st = WalletState::from_bytes(&bytes).unwrap();
+        assert_eq!(st.version, STATE_VERSION);
+        assert_eq!((st.height, st.tip_hash, st.next_ec_hybrid_index), (42, d(4), 2));
+        assert_eq!(st.utxos.len(), 1);
+        assert_eq!(st.utxos[0].key, KeyRef::EcHybrid(1));
+        assert_eq!(st.utxos[0].received_height, 40);
+        assert_eq!(st.utxos[0].block_leaves, None);
+        assert!(st.expected.is_empty() && st.watch.is_empty());
+
+        // And the new layout reads back as itself.
+        let again = WalletState::from_bytes(&st.to_bytes().unwrap()).unwrap();
+        assert_eq!(again.utxos[0].received_height, 40);
+        assert_eq!(again.next_symmetric_index, 4);
+    }
+}

@@ -85,13 +85,3 @@ export async function wipeExcept(keepPrefixes) {
 export async function wipe() {
   await Promise.all(Object.values(STORES).map((s) => clear(s)));
 }
-
-/** Atomic multi-store commit for a contact/watch import. */
-export async function putAcross(entries) {
-  const db = await openDb();
-  return new Promise((resolve,reject) => {
-    const t = db.transaction([...new Set(entries.map(e=>e.store))], 'readwrite');
-    t.oncomplete = resolve; t.onerror = () => reject(t.error); t.onabort = () => reject(t.error);
-    for (const e of entries) t.objectStore(e.store).put(e.value,e.key);
-  });
-}

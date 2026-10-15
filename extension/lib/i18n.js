@@ -1,4 +1,3 @@
-import { ADDITIONAL, PHRASES } from './languages.js';
 // Interface text in English, French and Arabic.
 //
 // Static text: elements carry data-i18n (text), data-i18n-ph (placeholder) or
@@ -1482,7 +1481,7 @@ const V15 = {
     "tor.s2Title": "Or the tor service (Homebrew)",
     "tor.s2": "Runs in the background, no window. Port 9050.",
     "tor.s3Title": "Then turn on Connect through Tor",
-    "tor.s3": "Accept the proxy permission when installing or updating the wallet. The light turns green when requests arrive through Tor.",
+    "tor.s3": "Chrome asks once to let the wallet set a proxy for its servers. The light turns green when requests arrive through Tor.",
     "tor.limits": "Through Tor, syncing is slower. A VPN or another proxy extension can block it. Using one server for both syncing and sending still lets it link them by timing.",
   },
   fr: {
@@ -1513,7 +1512,7 @@ const V15 = {
     "tor.s2Title": "Ou le service tor (Homebrew)",
     "tor.s2": "Tourne en arrière-plan, sans fenêtre. Port 9050.",
     "tor.s3Title": "Puis activez Se connecter via Tor",
-    "tor.s3": "Acceptez l’autorisation proxy lors de l’installation ou de la mise à jour. Le voyant devient vert lorsque les requêtes passent par Tor.",
+    "tor.s3": "Chrome demande une fois l’autorisation de définir un proxy pour ses serveurs. Le voyant passe au vert quand les requêtes arrivent par Tor.",
     "tor.limits": "Via Tor, la synchronisation est plus lente. Un VPN ou une autre extension proxy peut le bloquer. Un même serveur pour synchroniser et envoyer peut encore les relier par le moment.",
   },
   ar: {
@@ -1544,7 +1543,7 @@ const V15 = {
     "tor.s2Title": "أو خدمة tor (Homebrew)",
     "tor.s2": "تعمل في الخلفية بلا نافذة. المنفذ 9050.",
     "tor.s3Title": "ثم فعّل الاتصال عبر Tor",
-    "tor.s3": "اقبل إذن الوكيل عند تثبيت المحفظة أو تحديثها. يصبح المؤشر أخضر عندما تصل الطلبات عبر Tor.",
+    "tor.s3": "يطلب Chrome مرة واحدة السماح للمحفظة بتعيين وكيل لخوادمها. يصبح المؤشر أخضر عندما تصل الطلبات عبر Tor.",
     "tor.limits": "عبر Tor تكون المزامنة أبطأ. قد يمنعه VPN أو إضافة وكيل أخرى. استخدام خادم واحد للمزامنة والإرسال يتيح له الربط بينهما بالتوقيت.",
   },
 };
@@ -2136,10 +2135,166 @@ const V20 = {
 };
 for (const l of Object.keys(V20)) Object.assign(STRINGS[l], V20[l]);
 
-for(const [code,values] of Object.entries(ADDITIONAL))STRINGS[code]=values;
-STRINGS.en['set.title']='Parameters';
+
+// 0.21: persistent independent watch entries.
+const V21 = {
+  "en": {
+    "watch.readOnly": "READ ONLY",
+    "watch.dashboard": "Watchlist",
+    "watch.addShort": "+ Add",
+    "watch.search": "Search watched addresses",
+    "watch.showHidden": "Show hidden",
+    "watch.count": "{n} addresses · {h} hidden",
+    "watch.hideAmounts": "Hide amounts",
+    "watch.showAmounts": "Show amounts",
+    "watch.paused": "Paused · progress saved",
+    "watch.caughtUp": "Read through block #{h}",
+    "watch.reading": "Reading watch-only blocks",
+    "watch.scanError": "Watch scan needs attention",
+    "watch.indexShort": "Fast Track · {n} coins",
+    "watch.indexProgress": "Index scan · {n} coins · {a}/{b} blocks",
+    "watch.modePrivate": "Private · read every block",
+    "watch.modeFast": "Fast Track · server index",
+    "watch.modeNode": "My node · server index",
+    "watch.modePrivateShort": "Private",
+    "watch.modeFastShort": "Fast Track",
+    "watch.modeNodeShort": "My node",
+    "watch.scanMode": "Scan method",
+    "watch.privateHint": "Downloads blocks and scans locally. Your viewing key stays on this device.",
+    "watch.fastHint": "Shares the address identifier and coin index sets with your sync server. The server can omit history. Falls back to a private scan if its index is unavailable.",
+    "watch.ownHint": "Uses your own node’s index. The node receives the address identifier and coin index sets. Viewing keys stay on this device.",
+    "watch.nodeUrl": "Your node URL",
+    "watch.nodeHint": "Run your node with --utxo-index and the utxoindex RPC module enabled.",
+    "watch.nodePermission": "Allow access to your node to continue.",
+    "watch.contact": "Saved contact (optional)",
+    "watch.noContact": "No contact",
+    "watch.pause": "Pause scan",
+    "watch.resume": "Resume scan",
+    "watch.hide": "Hide asset",
+    "watch.unhide": "Show asset",
+    "watch.retry": "Retry scan",
+    "watch.fastFallback": "Index unavailable; continuing with a private scan.",
+    "watch.tipMoved": "Chain changed; restarting index scan.",
+    "watch.remove": "Stop following",
+    "watch.removeAgain": "Tap again to stop following",
+    "watch.empty": "No visible watched addresses. Add one or enable Show hidden.",
+    "ct.title": "Contacts",
+    "ct.secondAddress": "Second address (optional)",
+    "ct.twoHint": "Save one Generation and one EC Hybrid address under the same contact. Watch entries stay separate.",
+    "ct.twoAddresses": "2 saved addresses",
+    "ct.bothKinds": "GEN + EC",
+    "tor.errPermission": "Proxy permission is missing. Reload this updated extension in chrome://extensions and accept Chrome’s permission request.",
+    "tor.errPolicy": "Chrome’s managed policy or command-line settings prevent proxy changes.",
+    "tor.errProxy": "Chrome could not apply the proxy. Reload the extension and check other proxy or VPN extensions.",
+    "tor.s3": "Enable this option after Tor connects. The extension requires Chrome’s proxy permission when installed or updated. The light turns green after the Tor check succeeds.",
+    "tor.routedNote": "These hosts use the local Tor SOCKS proxy. Local nodes connect directly. Other Chrome traffic uses your system connection. This does not provide Tor Browser’s protections."
+  },
+  "fr": {
+    "watch.readOnly": "LECTURE SEULE",
+    "watch.dashboard": "Adresses suivies",
+    "watch.addShort": "+ Ajouter",
+    "watch.search": "Rechercher une adresse suivie",
+    "watch.showHidden": "Afficher les masquées",
+    "watch.count": "{n} adresses · {h} masquées",
+    "watch.hideAmounts": "Masquer les montants",
+    "watch.showAmounts": "Afficher les montants",
+    "watch.paused": "En pause · progression enregistrée",
+    "watch.caughtUp": "Lu jusqu’au bloc nº {h}",
+    "watch.reading": "Lecture des blocs suivis",
+    "watch.scanError": "Le suivi nécessite une action",
+    "watch.indexShort": "Fast Track · {n} pièces",
+    "watch.indexProgress": "Index · {n} pièces · {a}/{b} blocs",
+    "watch.modePrivate": "Privé · lire chaque bloc",
+    "watch.modeFast": "Fast Track · index serveur",
+    "watch.modeNode": "Mon nœud · index serveur",
+    "watch.modePrivateShort": "Privé",
+    "watch.modeFastShort": "Fast Track",
+    "watch.modeNodeShort": "Mon nœud",
+    "watch.scanMode": "Méthode de lecture",
+    "watch.privateHint": "Télécharge les blocs et les analyse localement. La clé de lecture reste sur cet appareil.",
+    "watch.fastHint": "Partage l’identifiant de l’adresse et les index des pièces avec le serveur. Le serveur peut omettre de l’historique. Revient à la lecture privée si l’index est indisponible.",
+    "watch.ownHint": "Utilise l’index de votre nœud. Il reçoit l’identifiant de l’adresse et les index des pièces. Les clés restent sur cet appareil.",
+    "watch.nodeUrl": "URL de votre nœud",
+    "watch.nodeHint": "Activez --utxo-index et le module RPC utxoindex sur votre nœud.",
+    "watch.nodePermission": "Autorisez l’accès à votre nœud pour continuer.",
+    "watch.contact": "Contact enregistré (facultatif)",
+    "watch.noContact": "Aucun contact",
+    "watch.pause": "Mettre en pause",
+    "watch.resume": "Reprendre",
+    "watch.hide": "Masquer l’actif",
+    "watch.unhide": "Afficher l’actif",
+    "watch.retry": "Réessayer",
+    "watch.fastFallback": "Index indisponible ; poursuite en lecture privée.",
+    "watch.tipMoved": "Chaîne modifiée ; redémarrage de la lecture de l’index.",
+    "watch.remove": "Arrêter le suivi",
+    "watch.removeAgain": "Appuyez encore pour arrêter",
+    "watch.empty": "Aucune adresse suivie visible. Ajoutez-en une ou affichez les adresses masquées.",
+    "ct.title": "Contacts",
+    "ct.secondAddress": "Deuxième adresse (facultatif)",
+    "ct.twoHint": "Enregistrez une adresse Generation et une EC Hybrid pour le même contact. Chaque adresse suivie reste séparée.",
+    "ct.twoAddresses": "2 adresses enregistrées",
+    "ct.bothKinds": "GEN + EC",
+    "tor.errPermission": "Permission proxy absente. Rechargez cette extension mise à jour dans chrome://extensions et acceptez la demande de Chrome.",
+    "tor.errPolicy": "Une politique Chrome ou une option de lancement empêche la modification du proxy.",
+    "tor.errProxy": "Chrome n’a pas pu appliquer le proxy. Rechargez l’extension et vérifiez les autres extensions proxy ou VPN.",
+    "tor.s3": "Activez cette option après la connexion de Tor. La permission proxy de Chrome est requise à l’installation ou à la mise à jour. Le voyant devient vert après vérification.",
+    "tor.routedNote": "Ces hôtes utilisent le proxy SOCKS Tor local. Les nœuds locaux sont joints directement. Le reste de Chrome utilise votre connexion système. Cela n’apporte pas les protections de Tor Browser."
+  },
+  "ar": {
+    "watch.readOnly": "للقراءة فقط",
+    "watch.dashboard": "قائمة المتابعة",
+    "watch.addShort": "+ إضافة",
+    "watch.search": "البحث في العناوين المتابعة",
+    "watch.showHidden": "إظهار المخفية",
+    "watch.count": "{n} عناوين · {h} مخفية",
+    "watch.hideAmounts": "إخفاء المبالغ",
+    "watch.showAmounts": "إظهار المبالغ",
+    "watch.paused": "متوقف مؤقتًا · التقدم محفوظ",
+    "watch.caughtUp": "تمت القراءة حتى الكتلة {h}",
+    "watch.reading": "قراءة كتل العناوين المتابعة",
+    "watch.scanError": "المتابعة تحتاج إلى إجراء",
+    "watch.indexShort": "Fast Track · {n} عملات",
+    "watch.indexProgress": "الفهرس · {n} عملات · {a}/{b} كتل",
+    "watch.modePrivate": "خاص · قراءة كل كتلة",
+    "watch.modeFast": "Fast Track · فهرس الخادم",
+    "watch.modeNode": "عقدتي · فهرس الخادم",
+    "watch.modePrivateShort": "خاص",
+    "watch.modeFastShort": "Fast Track",
+    "watch.modeNodeShort": "عقدتي",
+    "watch.scanMode": "طريقة القراءة",
+    "watch.privateHint": "تنزيل الكتل وفحصها محليًا. يبقى مفتاح العرض على هذا الجهاز.",
+    "watch.fastHint": "يشارك معرّف العنوان ومجموعات فهارس العملات مع الخادم. قد يحذف الخادم جزءًا من السجل. يعود للفحص الخاص إذا تعذر الفهرس.",
+    "watch.ownHint": "يستخدم فهرس عقدتك. تستقبل العقدة معرّف العنوان ومجموعات فهارس العملات. تبقى المفاتيح على هذا الجهاز.",
+    "watch.nodeUrl": "رابط عقدتك",
+    "watch.nodeHint": "شغّل عقدتك مع --utxo-index ووحدة RPC المسماة utxoindex.",
+    "watch.nodePermission": "اسمح بالوصول إلى عقدتك للمتابعة.",
+    "watch.contact": "جهة اتصال محفوظة (اختياري)",
+    "watch.noContact": "بدون جهة اتصال",
+    "watch.pause": "إيقاف مؤقت",
+    "watch.resume": "استئناف",
+    "watch.hide": "إخفاء الأصل",
+    "watch.unhide": "إظهار الأصل",
+    "watch.retry": "إعادة المحاولة",
+    "watch.fastFallback": "الفهرس غير متاح؛ المتابعة بفحص خاص.",
+    "watch.tipMoved": "تغيرت السلسلة؛ إعادة فحص الفهرس.",
+    "watch.remove": "إلغاء المتابعة",
+    "watch.removeAgain": "اضغط مجددًا لإلغاء المتابعة",
+    "watch.empty": "لا توجد عناوين متابعة ظاهرة. أضف عنوانًا أو أظهر المخفية.",
+    "ct.title": "جهات الاتصال",
+    "ct.secondAddress": "عنوان ثانٍ (اختياري)",
+    "ct.twoHint": "احفظ عنوان Generation وعنوان EC Hybrid لنفس جهة الاتصال. تبقى العناوين المتابعة منفصلة.",
+    "ct.twoAddresses": "عنوانان محفوظان",
+    "ct.bothKinds": "GEN + EC",
+    "tor.errPermission": "إذن الوكيل مفقود. أعد تحميل الإضافة المحدّثة من chrome://extensions واقبل طلب Chrome.",
+    "tor.errPolicy": "تمنع سياسة Chrome أو إعدادات التشغيل تغيير الوكيل.",
+    "tor.errProxy": "تعذر تطبيق الوكيل. أعد تحميل الإضافة وتحقق من إضافات الوكيل وVPN الأخرى.",
+    "tor.s3": "فعّل هذا الخيار بعد اتصال Tor. يلزم إذن الوكيل عند تثبيت الإضافة أو تحديثها. يتحول المؤشر للأخضر بعد نجاح التحقق.",
+    "tor.routedNote": "تستخدم هذه المواقع وكيل Tor SOCKS المحلي. تتصل العقد المحلية مباشرة. يستخدم باقي Chrome اتصال النظام. هذا لا يوفر حماية متصفح Tor."
+  }
+};
+for (const l of Object.keys(V21)) Object.assign(STRINGS[l], V21[l]);
+
 export const LANGUAGES = Object.keys(STRINGS);
-const englishKeys=new Map(Object.entries(STRINGS.en).map(([key,value])=>[value,key]));
 let current = 'en';
 
 function detect() {
@@ -2163,14 +2318,7 @@ export function t(key, vars) {
   return vars ? s.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? '')) : s;
 }
 
-export function translateText(text, vars) {
-  const key=englishKeys.get(text);
-  const value=PHRASES[current]?.[text] ?? (key?STRINGS[current][key]:undefined) ?? text;
-  return vars?value.replace(/\{(\w+)\}/g,(_,k)=>String(vars[k]??'')):value;
-}
-
 export function applyI18n(root) {
-  for(const el of root.querySelectorAll('[data-i18n-text]'))el.textContent=translateText(el.dataset.i18nText);
   for (const el of root.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
   for (const el of root.querySelectorAll('[data-i18n-ph]')) el.placeholder = t(el.dataset.i18nPh);
   for (const el of root.querySelectorAll('[data-i18n-aria]')) {

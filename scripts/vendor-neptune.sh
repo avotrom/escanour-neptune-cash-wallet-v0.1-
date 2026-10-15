@@ -24,6 +24,5 @@ fi
 
 echo "applying $(basename "$PATCH")"
 git -C "$DEST" apply --whitespace=nowarn "$PATCH"
-python3 "$ROOT/scripts/cleanup-wasm-warnings.py" "$DEST"
 git -C "$DEST" diff --stat
 echo "done: vendor/neptune-core is ready"

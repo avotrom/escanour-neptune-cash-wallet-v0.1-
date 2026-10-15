@@ -69,7 +69,7 @@ export async function exists() {
 }
 
 /** Check the password and keep the key for this browser session. */
-export async function unlock(password, authorize = async () => {}) {
+export async function unlock(password) {
   const v = await db.get(db.STORES.kv, 'vault');
   if (!v) throw new Error('No wallet on this device');
   const key = await deriveKey(password, v.salt);
@@ -78,7 +78,6 @@ export async function unlock(password, authorize = async () => {}) {
   } catch {
     throw new Error('Wrong password');
   }
-  await authorize(key);
   await rememberKey(key);
   return key;
 }

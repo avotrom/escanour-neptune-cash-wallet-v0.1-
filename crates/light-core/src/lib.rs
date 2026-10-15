@@ -31,6 +31,7 @@ pub mod send;
 pub mod state;
 pub mod sync;
 pub mod watch;
+pub mod watch_fast;
 
 pub use neptune_consensus;
 pub use neptune_mutator_set;

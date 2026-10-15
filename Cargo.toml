@@ -10,7 +10,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.21.0"
 edition = "2021"
 # Proprietary, all rights reserved: see LICENSE. Never published to crates.io.
 license = "LicenseRef-Proprietary"

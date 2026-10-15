@@ -309,3 +309,25 @@ pub fn report_exact(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sender_view;
+
+    #[test]
+    fn sender_takes_out_its_whole_block() {
+        // Range 10..=29, the coin's block added leaves 15..=18.
+        assert_eq!(sender_view(20, None, (10, 29), Some((15, 18)), false), 16);
+        // Leaf 16 provably spent: not counted in `possible`, not taken twice.
+        let spent = vec![(16, 16)];
+        assert_eq!(sender_view(19, Some(&spent[..]), (10, 29), Some((15, 18)), false), 16);
+        // Block unknown: only the coin itself comes out.
+        assert_eq!(sender_view(20, None, (10, 29), None, false), 19);
+        // Block partly past the range's existing leaves.
+        assert_eq!(sender_view(12, None, (10, 21), Some((20, 25)), false), 10);
+        // A lustrated spend shows its leaf: no one to hide among.
+        assert_eq!(sender_view(20, None, (10, 29), Some((15, 18)), true), 0);
+        // A coin alone in its range.
+        assert_eq!(sender_view(1, None, (7, 7), Some((7, 7)), false), 0);
+    }
+}

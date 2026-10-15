@@ -15,12 +15,9 @@ import initLight, * as light from './pkg/light/light_wasm.js';
 import * as db from './lib/db.js';
 import * as vault from './lib/vault.js';
 import * as rpc from './lib/rpc.js';
-import { guardedFetch, readJSON, torHosts, pacScript, isLocalHost } from './lib/network.js';
 import * as settingsStore from './lib/settings.js';
-import * as authenticator from './lib/authenticator.js';
-import * as backup from './lib/backup.js';
-import { portfolios, activityFeed, scanProgress, paymentTimeline, assistantAnswer, trustedMessage } from './lib/dashboard.js';
 import { t, setLanguage } from './lib/i18n.js';
+import { activeWatchIds, contactAddresses, decorateWatch, singleFlight } from './lib/watch-model.js';
 
 const SNAPSHOTS_KEPT = 30;
 const MAX_BLOCKS_PER_RUN = 2000; // one chunk; the next follows right away (scheduleFollowUp)
@@ -49,11 +46,9 @@ function wasm() {
   return wasmReady;
 }
 
-let walletEpoch = 0;
 let walletCache = null; // { id, wallet }
 
 async function openWallet() {
-  const epoch = walletEpoch;
   const key = await vault.sessionKey();
   if (!key) return null;
   const s = await settingsStore.load();
@@ -62,14 +57,13 @@ async function openWallet() {
   if (walletCache?.id === id) return { key, wallet: walletCache.wallet, s };
   await wasm();
   const phrase = await vault.phrase(key);
-  const stillUnlocked = await vault.sessionKey();
-  if (epoch !== walletEpoch || !stillUnlocked) return null;
+  walletCache?.wallet.free?.();
   walletCache = { id, wallet: new light.LightWallet(phrase, s.network) };
   return { key, wallet: walletCache.wallet, s };
 }
 
 function dropWallet() {
-  walletEpoch += 1;
+  walletCache?.wallet.free?.();
   walletCache = null;
   snapCache = null;
 }
@@ -107,7 +101,7 @@ function exclusive(fn) {
 let wanted = 0;
 function exclusiveNow(fn) {
   wanted += 1;
-  rpc.cancelBackground();
+  rpc.interrupt();
   let counted = true;
   const release = () => {
     if (counted) {
@@ -120,8 +114,7 @@ function exclusiveNow(fn) {
     return fn();
   }).finally(release);
 }
-let pauseRequested = false;
-const yieldNow = () => wanted > 0 || pauseRequested;
+const yieldNow = () => wanted > 0;
 
 // Jobs the popup can cancel while they wait, and their progress.
 const cancelledJobs = new Set();
@@ -183,18 +176,16 @@ async function status(network) {
 
 let statusWrites = Promise.resolve();
 function setStatus(patch, network) {
-  const run=statusWrites.then(async()=>{
-  const n = network || (await currentNetwork());
-  const previous = await status(n);
-  const next = { ...previous, ...patch };
-  next.scan = scanProgress(previous, next);
-  next.scanSample = next.scan.scanSample;
-  await chrome.storage.session.set({ [`status:${n}`]: next });
-  chrome.runtime.sendMessage({ target: 'popup', type: 'status', network: n, status: next }).catch(() => {});
-  return next;
-
-  });
-  statusWrites=run.catch(()=>{});return run;
+  const write = async () => {
+    const n = network || (await currentNetwork());
+    const next = { ...(await status(n)), ...patch };
+    await chrome.storage.session.set({ [`status:${n}`]: next });
+    notify('status', { network: n, status: next });
+    return next;
+  };
+  const result = statusWrites.then(write, write);
+  statusWrites = result.catch(() => {});
+  return result;
 }
 
 function notify(type, extra = {}) {
@@ -227,12 +218,11 @@ async function pushNotice(kind, vars = {}) {
     if (s.notifications === false || !chrome.notifications) return;
     setLanguage(s.language);
     const net = s.network === 'main' ? '' : ` (${s.network === 'testnet' ? t('net.testnet') : t('net.mock')})`;
-    const details = s.notificationDetails === true;
     await chrome.notifications.create(`esc-${kind}-${Date.now()}`, {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icons/icon128.png'),
       title: `${t(`nt.${kind}Title`, vars)}${net}`,
-      message: details ? t(`nt.${kind}`, vars) : 'Wallet activity updated. Open Escanour to view the details.',
+      message: t(`nt.${kind}`, vars),
       priority: 1,
     });
   } catch {
@@ -276,7 +266,9 @@ async function latestSnapshot(key, network) {
     return { height: snapCache.height, state: snapCache.state };
   }
   const box = await db.get(db.STORES.snapshots, snapKey(n, heights[0]));
-  const state = await vault.decrypt(key, box);
+  let state = await vault.decrypt(key, box);
+  const meta = await readWatchData(key, n);
+  if (meta && walletCache?.wallet) state = walletCache.wallet.watchReconcile(state, JSON.stringify(meta.records));
   snapCache = { key, network: n, height: heights[0], state };
   return { height: heights[0], state };
 }
@@ -387,10 +379,10 @@ async function expireOldSends(key, height) {
 // ----------------------------------------------------------------- sync ----
 
 // The tip check runs every minute, so it is plain JSON: no wasm to load.
-async function fetchHeight(server) {
+async function fetchHeight(server, { interruptible = false } = {}) {
   if (!server) throw new Error('NEED_SERVER');
   const body = JSON.stringify({ jsonrpc: '2.0', id: rpc.id(), method: 'chain_height', params: [] });
-  const text = await rpc.post(server, body, { timeoutMs: 20_000 });
+  const text = await rpc.post(server, body, { timeoutMs: 20_000, interruptible });
   const h = JSON.parse(text)?.result?.height;
   const n = typeof h === 'string' ? Number(h) : h;
   if (Number.isSafeInteger(n) && n >= 0) return n;
@@ -434,6 +426,7 @@ async function heightAtDate(server, dateMs) {
 
 const TOR_CHECK_URL = 'https://check.torproject.org/api/ip';
 const TOR_RECHECK_MS = 10 * 60_000;
+const isLocalHost = (h) => ['localhost', '127.0.0.1', '[::1]'].includes(h);
 
 async function torState() {
   const r = await chrome.storage.session.get('tor');
@@ -441,9 +434,38 @@ async function torState() {
 }
 
 async function setTorState(next) {
+  next = { ...next, required: next.state !== 'off' };
   await chrome.storage.session.set({ tor: next });
   notify('tor', { tor: next });
   return next;
+}
+
+function torHosts(s) {
+  const hosts = new Set(['api.coingecko.com', 'check.torproject.org']);
+  for (const srv of Object.values(s.servers || {})) {
+    for (const u of [srv.sync, srv.broadcast]) {
+      try {
+        const h = new URL(u).hostname;
+        if (h && !isLocalHost(h)) hosts.add(h);
+      } catch {
+        /* empty or invalid: nothing to route */
+      }
+    }
+  }
+  for (const url of s.watchNodes || []) {
+    try { const h = new URL(url).hostname; if (!isLocalHost(h)) hosts.add(h); } catch {}
+  }
+  return [...hosts];
+}
+
+function pacScript(hosts, port) {
+  return `function FindProxyForURL(url, host) {
+  var tor = ${JSON.stringify(hosts)};
+  for (var i = 0; i < tor.length; i++) {
+    if (host === tor[i]) return "SOCKS5 127.0.0.1:${Number(port)}";
+  }
+  return "DIRECT";
+}`;
 }
 
 /** Set or clear the proxy to match the settings, then check Tor. */
@@ -458,20 +480,18 @@ async function applyTor({ check = true } = {}) {
     return setTorState({ state: 'off' });
   }
   const port = Number(s.torPort) || 9150;
-  const control = await chrome.proxy.settings.get({});
-  if (control.levelOfControl === 'not_controllable') return setTorState({ state: 'error', error: 'POLICY', port, at: Date.now() });
-  if (control.levelOfControl === 'controlled_by_other_extensions') return setTorState({ state: 'error', error: 'OTHER_PROXY', port, at: Date.now() });
   try {
-  await chrome.proxy.settings.set({
-    value: { mode: 'pac_script', pacScript: { data: pacScript(torHosts(s), port), mandatory: true } },
-    scope: 'regular',
-  });
+    const control = await chrome.proxy.settings.get({});
+    if (!['controllable_by_this_extension', 'controlled_by_this_extension'].includes(control.levelOfControl)) {
+      return setTorState({ state: 'error', error: control.levelOfControl === 'not_controllable' ? 'POLICY' : 'OTHER_PROXY', port, at: Date.now() });
+    }
+    await chrome.proxy.settings.set({
+      value: { mode: 'pac_script', pacScript: { data: pacScript(torHosts(s), port), mandatory: true } }, scope: 'regular',
+    });
+    const got = await chrome.proxy.settings.get({});
+    if (got.levelOfControl !== 'controlled_by_this_extension') return setTorState({ state: 'error', error: 'OTHER_PROXY', port, at: Date.now() });
   } catch (e) {
-    return setTorState({ state: 'error', error: 'PROXY_FAILED', detail: String(e.message || e), port, at: Date.now() });
-  }
-  const got = await chrome.proxy.settings.get({});
-  if (got.levelOfControl !== 'controlled_by_this_extension') {
-    return setTorState({ state: 'error', error: 'OTHER_PROXY', port, at: Date.now() });
+    return setTorState({ state: 'error', error: 'PROXY_ERROR', detail: String(e.message || e).slice(0, 150), port, at: Date.now() });
   }
   return check ? checkTor() : torState();
 }
@@ -483,7 +503,8 @@ async function checkTor() {
   const port = Number(s.torPort) || 9150;
   await setTorState({ state: 'connecting', port, at: Date.now() });
   try {
-    const j = await guardedFetch(TOR_CHECK_URL, { cache: 'no-store', signal: AbortSignal.timeout(25_000) }, {torCheck:true}, readJSON);
+    const res = await fetch(TOR_CHECK_URL, { cache: 'no-store', credentials: 'omit', signal: AbortSignal.timeout(30_000) });
+    const j = await res.json();
     if (j?.IsTor === true) return setTorState({ state: 'on', port, at: Date.now() });
     return setTorState({ state: 'error', error: 'NOT_TOR', port, at: Date.now() });
   } catch {
@@ -617,10 +638,10 @@ async function fetchBlocksAt(server, heights, onBody, stopEarly = false) {
       let body;
       for (let attempt = 0; ; attempt++) {
         try {
-          body = await rpc.post(server, light.getBlocksRequest(rpc.id(), from, to), { timeoutMs: BLOCKS_TIMEOUT_MS, background: true });
+          body = await rpc.post(server, light.getBlocksRequest(rpc.id(), from, to), { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
           break;
         } catch (e) {
-          if (yieldNow() || e.name === 'AbortError' || attempt >= 3) throw e;
+          if (e.message === 'SCAN_INTERRUPTED' || attempt >= 3) throw e;
           await sleep(800 * (attempt + 1));
         }
       }
@@ -635,69 +656,47 @@ async function fetchBlocksAt(server, heights, onBody, stopEarly = false) {
  * instead of a full scan; the server learns which coins are the wallet's.
  * Throws FAST_UNSUPPORTED when the server has no UTXO index.
  */
-async function fetchFlagHeights(server, request, restore) {
-  const original=JSON.parse(request),params=original.params;
-  const flags=Array.isArray(params)&&Array.isArray(params[0])?params[0]:params?.announcement_flags;
-  if(!Array.isArray(flags)||!flags.length)return restore.heightsToFetch(await rpc.post(server,request,{timeoutMs:BLOCKS_TIMEOUT_MS,background:true}));
-  const found=new Set();
-  const fetchPart=async part=>{
-    const next={...original,id:rpc.id(),params:Array.isArray(params)?[part,...params.slice(1)]:{...params,announcement_flags:part}};
-    try{for(const height of restore.heightsToFetch(await rpc.post(server,JSON.stringify(next),{timeoutMs:BLOCKS_TIMEOUT_MS,background:true})))found.add(height);}
-    catch(e){
-      if(yieldNow()||part.length<=1||!/(?:timeout|timed out|HTTP (?:413|429|502|503|504)|too many|too large|limit)/i.test(String(e.message)))throw e;
-      const mid=Math.ceil(part.length/2);await fetchPart(part.slice(0,mid));await fetchPart(part.slice(mid));
-    }
-  };
-  for(let i=0;i<flags.length;i+=20){if(yieldNow())throw new DOMException('Interrupted','AbortError');await fetchPart(flags.slice(i,i+20));}
-  return [...found].sort((a,b)=>a-b);
-}
-
 async function fastRestore(wallet, server, onProgress) {
   const fr = new light.FastRestore();
   try {
-    if(typeof fr.setChunkSize!=='function')throw new Error('Wallet modules are out of date. Rebuild both WASM modules and reload the extension.');
     // 1. Which blocks hold payments to our keys. Each round can reveal keys
     //    beyond the look-ahead window; the next round asks about those too.
     for (let round = 0; round < 64; round++) {
       const req = fr.flagsRequest(wallet, rpc.id());
       if (!req) break;
-      let heights;
+      let body;
       try {
-        heights = await fetchFlagHeights(server, req, fr);
+        body = await rpc.post(server, req, { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
       } catch (e) {
-        if (round === 0 && /-32601|method not found|index.*(?:disabled|not enabled|not available)/i.test(String(e.message))) throw new Error(`FAST_UNSUPPORTED: ${e.message}`);
+        if (e.message === 'SCAN_INTERRUPTED') throw e;
+        if (round === 0) throw new Error(`FAST_UNSUPPORTED: ${e.message}`);
         throw e;
       }
+      const heights = fr.heightsToFetch(body);
       await fetchBlocksAt(server, heights, async (b) => {
         fr.scanBlocks(wallet, b);
-        onProgress?.({...fr.progress(),phase:'scan'});
+        onProgress?.(fr.progress());
       });
     }
-    if(fr.flagsRequest(wallet,rpc.id())) throw new Error('Fast restore key discovery exceeded its safety limit. Use the full scan.');
     // 2. Membership proofs, all relative to one block, checked locally.
-    onProgress?.({...fr.progress(),phase:'proofs'});
-    let proofSize=64;fr.setChunkSize(proofSize);
-    if (fr.restoreChunks() > 0) {
+    const chunks = fr.restoreChunks();
+    if (chunks > 0) {
       for (let attempt = 0; ; attempt++) {
         try {
-          for (let i = 0; i < fr.restoreChunks(); i++) {
-            fr.applyRestore(i, await rpc.post(server, fr.restoreRequest(rpc.id(), i), { timeoutMs: BLOCKS_TIMEOUT_MS, background:true }));
+          for (let i = 0; i < chunks; i++) {
+            fr.applyRestore(i, await rpc.post(server, fr.restoreRequest(rpc.id(), i), { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true }));
           }
           break;
         } catch (e) {
-          const error=String(e.message);
-          if(yieldNow()||attempt>=6)throw e;
-          if(/TIP_MOVED/.test(error)){fr.resetProofs();continue;}
-          if(proofSize>1&&/(?:timeout|timed out|HTTP (?:413|429|502|503|504)|too many|too large|limit)/i.test(error)){proofSize=Math.max(1,Math.floor(proofSize/2));fr.setChunkSize(proofSize);continue;}
-          throw e;
+          if (!/TIP_MOVED/.test(String(e.message)) || attempt >= 4) throw e;
+          fr.resetProofs();
         }
       }
       // 3. Where spent coins were spent, for the history. Optional.
-      onProgress?.({...fr.progress(),phase:'history'});
       const spentReq = fr.spentRequest(rpc.id());
       if (spentReq) {
         try {
-          const heights = fr.parseSpentHeights(await rpc.post(server, spentReq, { timeoutMs: BLOCKS_TIMEOUT_MS, background:true }));
+          const heights = fr.parseSpentHeights(await rpc.post(server, spentReq, { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true }));
           await fetchBlocksAt(server, heights, async (b) => fr.scanSpends(wallet, b));
         } catch {
           // Without it, spent coins still count as spent; only their dates are missing.
@@ -705,10 +704,8 @@ async function fastRestore(wallet, server, onProgress) {
       }
     }
     // 4. Wallet state at the block the proofs belong to (the tip if nothing was found).
-    onProgress?.({...fr.progress(),phase:'finish'});
     const h = fr.snapshotHeight() ?? (await fetchHeight(server));
-    if(h===0) return {height:0,state:wallet.genesisState(),events:[]};
-    const block = await rpc.post(server, light.getBlocksRequest(rpc.id(), h, h), { timeoutMs: BLOCKS_TIMEOUT_MS, background: true });
+    const block = await rpc.post(server, light.getBlocksRequest(rpc.id(), h, h), { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
     return fr.finish(wallet, block);
   } finally {
     fr.free?.();
@@ -716,38 +713,26 @@ async function fastRestore(wallet, server, onProgress) {
 }
 
 /** Run a pending fast restore inside a sync run. Returns the new snapshot, or null. */
-async function saveRestorePlan(key,network,plan) {
-  await db.put(db.STORES.kv,`restorePlan:${network}`,{box:await vault.encrypt(key,enc.encode(JSON.stringify(plan)))});
-}
-async function readRestorePlan(key,network) {
-  const saved=await db.get(db.STORES.kv,`restorePlan:${network}`);if(!saved)return null;
-  if(saved.box)return JSON.parse(dec.decode(await vault.decrypt(key,saved.box)));
-  await saveRestorePlan(key,network,saved);return saved;
-}
-
 async function runFastRestore({ key, wallet, s, server, st, snap }) {
   const mode = st.fastPending;
   await setStatus({ fastPhase: 'scan', syncing: true });
   try {
     const out = await fastRestore(wallet, server, (p) => {
-      setStatus({ fastPhase:p.phase||'scan', fastFound: p.coins_found, fastBlocks: p.blocks_scanned }).catch(() => {});
+      setStatus({ fastPhase: 'scan', fastFound: p.coins_found, fastBlocks: p.blocks_scanned }).catch(() => {});
     });
     if (snap?.state) out.state = wallet.carryOver(snap.state, out.state);
     await dropSnapshots(s.network);
     await saveSnapshot(key, out.height, out.state);
     if (out.events?.length && (await recordBlockEvents(key, out.events))) notify('activity');
     await db.put(db.STORES.kv, `fastRestored:${s.network}`, { mode, server, at: Date.now() });
-    await saveRestorePlan(key,s.network,{mode,pending:false,completedAt:Date.now()});
-    await setStatus({ fastPending: null, fastPhase: null, fastFailed: null, fastFailureDetail:null, height: out.height, startHeight: out.height, restored: true });
+    await setStatus({ fastPending: null, fastPhase: null, fastFailed: null, height: out.height, startHeight: out.height, restored: true });
     return { height: out.height, state: out.state };
   } catch (e) {
     // No index on this server, or it answered something we could not check:
     // fall back to the private full scan, which needs nothing from the server.
     const msg = String(e.message || e);
-    const interrupted = e.name==='AbortError' && yieldNow();
-    const failure = /FAST_UNSUPPORTED/.test(msg) ? 'unsupported' : interrupted ? 'interrupted' : 'failed';
-    await saveRestorePlan(key,s.network,{mode,pending:interrupted,error:msg.slice(0,500),failure,failedAt:Date.now(),fallback:interrupted?null:'private'});
-    await setStatus({ fastPending: interrupted?mode:null, fastPhase:null, fastFailed:failure, fastFailureDetail:msg.slice(0,500) });
+    if (msg === 'SCAN_INTERRUPTED') throw e;
+    await setStatus({ fastPending: null, fastPhase: null, fastFailed: /FAST_UNSUPPORTED/.test(msg) ? 'unsupported' : msg.slice(0, 200) });
     return null;
   }
 }
@@ -757,43 +742,30 @@ const tune = { parallel: 2, maxParallel: PREFETCH, size: 0, good: 0 };
 
 let followUp = null;
 function scheduleFollowUp() {
-  if (followUp || pauseRequested) return;
+  if (followUp) return;
   followUp = setTimeout(() => {
     followUp = null;
     syncOnce().catch(() => {});
   }, 200);
 }
 
-let activeSync = null;
-function syncOnce() {
-  if (activeSync) return activeSync;
-  activeSync = runSync().finally(() => { activeSync = null; });
-  return activeSync;
-}
-
-function runSync() {
-  return keepAlive(() =>
+const syncOnce = singleFlight(() => keepAlive(() =>
     exclusive(async () => {
       await migrateStorage();
       if (!(await vault.sessionKey())) return;
       const s0 = await settingsStore.load();
-      pauseRequested = Boolean(await db.get(db.STORES.kv, `scanPaused:${s0.network}`));
-      if (pauseRequested) { await setStatus({scanPaused:true, syncing:false}); return; }
+      if (s0.tor && !(await torState()).required) await applyTor();
       const server = settingsStore.serversFor(s0).sync;
 
       let tip;
       try {
-        tip = await fetchHeight(server);
+        tip = await fetchHeight(server, { interruptible: true });
       } catch (e) {
+        if (e.message === 'SCAN_INTERRUPTED') throw e;
         await setStatus({ serverOk: false, lastCheckAt: Date.now(), error: e.message === 'NEED_SERVER' ? 'NEED_SERVER' : null });
         throw e;
       }
-      let st = await status();
-      const restorePlan = await readRestorePlan(await vault.sessionKey(),s0.network);
-      if(restorePlan?.pending && !st.fastPending) st=await setStatus({fastPending:restorePlan.mode});
-      const current = await openWallet();
-      const currentSnap = current && await latestSnapshot(current.key);
-      const watchNeed = currentSnap && current.wallet.watchNeeds(currentSnap.state);
+      const st = await status();
       // Nothing new on chain: a status update and done. The wallet is not
       // opened, nothing is decrypted and no wasm is loaded.
       const [savedHeight] = await snapHeights(s0.network);
@@ -801,7 +773,7 @@ function runSync() {
         || (st.spendIndex && st.spendIndex.total >= savedHeight && st.spendIndex.have >= st.spendIndex.total);
       const archiveDone = !s0.localArchive || (st.archive && st.archive.state === 'ready'
         && st.archive.target >= Math.max(0, savedHeight - ARCHIVE_LAG) && !st.adoptPending);
-      if (savedHeight != null && savedHeight >= tip && st.height === savedHeight && !st.error && indexDone && !watchNeed && archiveDone && !st.fastPending) {
+      if (savedHeight != null && savedHeight >= tip && st.height === savedHeight && !st.error && indexDone && !st.watchBehind && archiveDone) {
         await setStatus({ serverOk: true, lastCheckAt: Date.now(), tip, syncing: false });
         return;
       }
@@ -811,10 +783,10 @@ function runSync() {
       const { key, wallet, s } = w;
       let snap = await latestSnapshot(key);
       if (!snap) throw new Error('This network has no wallet state yet. Switch to it again from the home page.');
+      const watchData = await watchDataFor(key, wallet, snap, s.network);
+      const watching = activeWatchIds(wallet.watchList(snap.state, Date.now()), watchData.prefs);
       if (st.fastPending && snap.height <= 1) {
-        await setStatus({height:snap.height,tip,serverOk:true});
         snap = (await runFastRestore({ key, wallet, s, server, st, snap })) || snap;
-        if(yieldNow()){scheduleFollowUp();return;}
       }
       await setStatus({
         serverOk: true, lastCheckAt: Date.now(), tip,
@@ -840,7 +812,7 @@ function runSync() {
           const from = nextFrom;
           const to = Math.min(from + tune.size - 1, runEnd);
           const job = { from, to, started: Date.now() };
-          job.body = rpc.post(server, light.getBlocksRequest(rpc.id(), from, to), { timeoutMs: BLOCKS_TIMEOUT_MS, background: true });
+          job.body = rpc.post(server, light.getBlocksRequest(rpc.id(), from, to), { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
           job.body.then(() => { job.ms = Date.now() - job.started; }, () => {}); // a discarded batch must not raise
           pending.push(job);
           nextFrom = to + 1;
@@ -862,7 +834,7 @@ function runSync() {
 
       while (snap.height < runEnd) {
         // A user action is waiting: save and step aside; the next run continues.
-        if (yieldNow()) break;
+        if (yieldNow() && applied > 0) break;
         fill();
         const job = pending.shift();
         if (!job) break;
@@ -876,7 +848,7 @@ function runSync() {
         } catch (e) {
           // Keep what was scanned so far, then ask for less, one at a time.
           await save();
-          if (yieldNow() || e.name === 'AbortError') break;
+          if (e.message === 'SCAN_INTERRUPTED') { scheduleFollowUp(); return; }
           if (++failures > MAX_FETCH_FAILURES) throw e;
           // Refused while several requests were open: stay below that from now on.
           if (tune.parallel > 1) tune.maxParallel = Math.max(1, tune.parallel - 1);
@@ -900,7 +872,7 @@ function runSync() {
           else if (tune.parallel < tune.maxParallel) tune.parallel += 1;
         }
 
-        const out = wallet.applyBlocks(snap.state, body);
+        const out = wallet.applyBlocksWatching(snap.state, body, JSON.stringify(watching));
         const r = out.result;
 
         if (r.reorg) {
@@ -908,18 +880,16 @@ function runSync() {
           await save();
           if (r.applied === 0) {
             // Our tip was orphaned: drop this snapshot and step back.
-            const latestWatchState = snap.state;
             await db.del(db.STORES.snapshots, snapKey(s.network, snap.height));
             snapCache = null;
             snap = await latestSnapshot(key);
             if (!snap) throw new Error('Reorganization deeper than saved history. Restore the wallet again.');
-            snap.state = wallet.reconcileWatch(latestWatchState, snap.state);
-            await saveSnapshot(key, snap.height, snap.state);
           }
           restart(); // the chain changed mid-request: refetch
           continue;
         }
 
+        if (!r.applied) throw new Error('The node returned no usable blocks. Retry or choose another sync server.');
         snap = { height: r.height, state: out.state };
         applied += r.applied;
         unsaved += r.applied;
@@ -942,7 +912,6 @@ function runSync() {
       if (await expireOldSends(key, snap.height)) notify('activity');
 
       await setStatus({ syncing: snap.height < tip, height: snap.height, lastSyncAt: Date.now() });
-      await watchAlerts({key, wallet, snap, network:s.network}).catch(() => {});
       // Not at the tip yet (a restore): carry on right away instead of waiting
       // a minute for the alarm. Each chunk releases the lock in between, so
       // other actions (send, receive, settings) are never blocked for long.
@@ -958,7 +927,8 @@ function runSync() {
           if (yieldNow()) more = true;
           else more = (await watchCatchUp({ key, wallet, server, snap })) || more;
         } catch (e) {
-          await setStatus({ watchError: String(e.message || e).slice(0, 200) });
+          if (e.message === 'SCAN_INTERRUPTED') more = true;
+          else await setStatus({ watchError: String(e.message || e).slice(0, 200) });
         }
         if (yieldNow()) {
           more = true;
@@ -979,10 +949,10 @@ function runSync() {
       }
     }),
   ).catch(async (e) => {
+    if (e.message === 'SCAN_INTERRUPTED') { scheduleFollowUp(); return; }
     if (e.message !== 'NEED_SERVER') await setStatus({ syncing: false, error: String(e.message || e) }).catch(() => {});
     throw e;
-  });
-}
+  }));
 
 // --------------------------------------------- blocks in strict order -----
 
@@ -991,7 +961,7 @@ function runSync() {
  * requests ahead). Stops early, between batches, when a user action waits.
  * Returns the last height handed over.
  */
-async function fetchInOrder(server, from, to, onBody, parallel = 2) {
+async function fetchInOrder(server, from, to, onBody) {
   const perCall = light.maxBlocksPerCall();
   const ranges = [];
   for (let a = from; a <= to; a += perCall) ranges.push([a, Math.min(to, a + perCall - 1)]);
@@ -999,9 +969,10 @@ async function fetchInOrder(server, from, to, onBody, parallel = 2) {
     const p = (async () => {
       for (let attempt = 0; ; attempt++) {
         try {
-          return await rpc.post(server, light.getBlocksRequest(rpc.id(), a, b), { timeoutMs: BLOCKS_TIMEOUT_MS, background: true });
+          return await rpc.post(server, light.getBlocksRequest(rpc.id(), a, b), { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
         } catch (e) {
-          if (yieldNow() || e.name === 'AbortError' || attempt >= 3) throw e;
+          if (e.message === 'SCAN_INTERRUPTED' || yieldNow()) throw e;
+          if (attempt >= 3) throw e;
           await sleep(800 * (attempt + 1));
         }
       }
@@ -1009,16 +980,12 @@ async function fetchInOrder(server, from, to, onBody, parallel = 2) {
     p.catch(() => {}); // awaited below; a rejection before that must not surface
     return p;
   };
-  const ahead = ranges.slice(0, parallel).map(get);
+  const ahead = ranges.slice(0, 2).map(get);
   let last = from - 1;
   for (let i = 0; i < ranges.length; i++) {
     if (yieldNow()) break;
-    let body;
-    try { body = await ahead[i]; } catch (e) {
-      if (yieldNow() || e.name === 'AbortError') break;
-      throw e;
-    }
-    if (i + parallel < ranges.length) ahead.push(get(ranges[i + parallel]));
+    const body = await ahead[i];
+    if (i + 2 < ranges.length) ahead.push(get(ranges[i + 2]));
     await onBody(body, ranges[i]);
     last = ranges[i][1];
   }
@@ -1030,34 +997,129 @@ async function fetchInOrder(server, from, to, onBody, parallel = 2) {
 // the wallet state (so a reorg rollback restores them too). A new one is
 // scanned from its first block in the background, here, a chunk per run.
 
+// Registration and preferences are one encrypted record, independent of block snapshots.
+async function readWatchData(key, network) {
+  const box = await db.get(db.STORES.kv, `watchData:${network || await currentNetwork()}`);
+  return box ? JSON.parse(dec.decode(await vault.decrypt(key, box))) : null;
+}
+async function writeWatchData(key, data, network) {
+  await db.put(db.STORES.kv, `watchData:${network || await currentNetwork()}`, await vault.encrypt(key, enc.encode(JSON.stringify(data))));
+}
+async function watchDataFor(key, wallet, snap, network) {
+  return await readWatchData(key, network) || {
+    records: wallet.watchRegistry(snap.state), prefs: {},
+    nextId: Math.max(0, ...wallet.watchList(snap.state, Date.now()).map((a) => a.id)) + 1,
+  };
+}
+const fastWatchKey = (net, id) => `watchFast:${net}:${id}`;
+
+// One bounded indexed step. The checkpoint holds only the watched account,
+// encrypted like the rest of the wallet, and survives worker termination.
+async function watchFastStep({ key, wallet, server, snap, account, pref, net }) {
+  const taskKey = fastWatchKey(net, account.id);
+  const box = await db.get(db.STORES.kv, taskKey);
+  let task = box ? JSON.parse(dec.decode(await vault.decrypt(key, box))) : { phase: 'flags', next: 0, offset: 0, heights: [] };
+  const scan = task.bytes ? light.WatchFastScan.fromBytes(new Uint8Array(task.bytes)) : new light.WatchFastScan(snap.state, account.id);
+  let consumed = false;
+  const checkpoint = async () => {
+    task.bytes = Array.from(scan.toBytes());
+    await db.put(db.STORES.kv, taskKey, await vault.encrypt(key, enc.encode(JSON.stringify(task))));
+    await setStatus({ watchBehind: { at: account.scanned_to, end: scan.height() },
+      watchFast: { id: account.id, phase: task.phase, done: task.next, total: task.heights.length, found: scan.found() } });
+  };
+  try {
+    const source = pref.mode === 'node' ? pref.server : server;
+    if (!source) throw new Error('Choose a node URL for this watched address');
+    const post = (body) => rpc.post(source, body, { timeoutMs: BLOCKS_TIMEOUT_MS, interruptible: true });
+    if (task.phase === 'flags') {
+      task.heights = Array.from(scan.heights(await post(scan.flagsRequest(rpc.id())), false));
+      task.phase = 'receipts'; task.next = 0;
+      await checkpoint();
+    }
+    const deadline = Date.now() + 3000;
+    let processed = 0;
+    while ((task.phase === 'receipts' || task.phase === 'spends') && task.next < task.heights.length) {
+      if (yieldNow() || processed >= 12 || Date.now() > deadline) { await checkpoint(); return true; }
+      const h = task.heights[task.next];
+      scan.scan(await post(light.getBlocksRequest(rpc.id(), h, h)));
+      task.next++; processed++;
+      // Every returned block is a durable checkpoint.
+      await checkpoint();
+    }
+    if (yieldNow()) { await checkpoint(); return true; }
+    if (task.phase === 'receipts') { task.phase = 'spendIndex'; task.next = 0; task.heights = []; await checkpoint(); }
+    if (task.phase === 'spendIndex') {
+      const req = scan.spentRequest(rpc.id(), task.offset);
+      if (req) {
+        task.heights = [...new Set([...task.heights, ...scan.heights(await post(req), true)])].sort((a, b) => a - b);
+        task.offset += 256;
+        await checkpoint();
+        return true;
+      }
+      task.phase = 'spends'; task.next = 0; await checkpoint();
+      if (task.heights.length) return true;
+    }
+    if (task.phase === 'spends' && task.next === task.heights.length) {
+      const anchor = await post(light.getBlocksRequest(rpc.id(), scan.height(), scan.height()));
+      // finish consumes the WASM object.
+      consumed = true;
+      const state = scan.finish(snap.state, anchor);
+      await saveSnapshot(key, snap.height, state, net); snap.state = state;
+      await db.del(db.STORES.kv, taskKey);
+      await setStatus({ watchFast: null, watchError: null });
+      notify('watch', { network: net });
+      return false;
+    }
+    return true;
+  } finally { if (!consumed) scan.free?.(); }
+}
+
 async function watchCatchUp({ key, wallet, server, snap }) {
-  const prefs = await settingsStore.load();
-  const need = wallet.watchNeeds(snap.state);
-  if (!need) {
-    await setStatus({ watchBehind: null, watchError: null });
-    return false;
+  const net = await currentNetwork();
+  const data = await watchDataFor(key, wallet, snap, net);
+  let list = decorateWatch(wallet.watchList(snap.state, Date.now()), data.prefs);
+  // Prefer the least-recently served indexed account so one long scan cannot starve another.
+  const indexed = list.filter((a) => !a.paused && a.mode !== 'private' && a.scanned_to < snap.height)
+    .sort((a, b) => (a.servedAt || 0) - (b.servedAt || 0));
+  if (indexed.length && !yieldNow()) {
+    const account = indexed[0];
+    const pref = data.prefs[account.id] ||= {};
+    try {
+      await watchFastStep({ key, wallet, server, snap, account, pref, net });
+    } catch (e) {
+      if (e.message === 'SCAN_INTERRUPTED') throw e;
+      await db.del(db.STORES.kv, fastWatchKey(net, account.id));
+      if (/WATCH_TIP_MOVED/.test(e.message)) { pref.warning = 'watch.tipMoved'; }
+      else { pref.mode = 'private'; pref.warning = 'watch.fastFallback'; }
+    }
+    pref.servedAt = Date.now();
+    await writeWatchData(key, data, net);
+    list = decorateWatch(wallet.watchList(snap.state, Date.now()), data.prefs);
   }
-  const [from, end] = need;
-  const to = Math.min(end, from + MAX_BLOCKS_PER_RUN - 1);
-  let state = snap.state;
-  await setStatus({ watchBehind: { at: from - 1, end } });
-  await fetchInOrder(server, from, to, async (body) => {
-    const out = wallet.watchCatchUp(state, body);
-    state = out.state;
-    // Commit each successful batch before publishing its progress.
-    await saveSnapshot(key, snap.height, state);
-    snap.state = state;
-    await watchAlerts({key, wallet, snap, network:prefs.network}).catch(() => {});
-    const remaining = wallet.watchNeeds(state);
-    await setStatus({ watchBehind: remaining ? { at: remaining[0] - 1, end: remaining[1] } : null });
-  }, prefs.watchScanMode === 'fast' ? 3 : 1);
-  // Same height, same chain: only the watch-only part changed.
-  await saveSnapshot(key, snap.height, state);
-  snap.state = state;
-  const left = Boolean(wallet.watchNeeds(state));
-  await setStatus({ watchBehind: left ? { at: wallet.watchNeeds(state)[0] - 1, end } : null, watchError: null });
-  notify('watch');
-  return left;
+  const active = list.filter((a) => !a.paused && a.scanned_to < snap.height);
+  const privateAccounts = active.filter((a) => a.mode === 'private');
+  if (privateAccounts.length && !yieldNow()) {
+    const from = Math.min(...privateAccounts.map((a) => a.scanned_to + 1));
+    const end = snap.height;
+    const to = Math.min(end, from + 100 - 1);
+    const ids = JSON.stringify(privateAccounts.map((a) => a.id));
+    await setStatus({ watchBehind: { at: from - 1, end }, watchError: null });
+    await fetchInOrder(server, from, to, async (body) => {
+      const out = wallet.watchCatchUpFor(snap.state, body, ids);
+      if (out.result.scanned === 0) throw new Error('The node returned no usable watch blocks. Retry or choose another sync server.');
+      // Save before publishing progress. A later failed request cannot undo it.
+      await saveSnapshot(key, snap.height, out.state, net);
+      snap.state = out.state;
+      const remaining = wallet.watchList(snap.state, Date.now()).filter((a) => privateAccounts.some((p) => p.id === a.id));
+      await setStatus({ watchBehind: { at: Math.min(...remaining.map((a) => a.scanned_to)), end }, watchError: null });
+      notify('watch', { network: net });
+    });
+  }
+  const left = decorateWatch(wallet.watchList(snap.state, Date.now()), data.prefs)
+    .filter((a) => !a.paused && a.scanned_to < snap.height);
+  await setStatus({ watchBehind: left.length ? { at: Math.min(...left.map((a) => a.scanned_to)), end: snap.height } : null,
+    watchFast: left.some((a) => a.mode !== 'private') ? (await status()).watchFast : null, watchError: null });
+  return left.length > 0;
 }
 
 /**
@@ -1071,10 +1133,10 @@ async function withState(fn, jobId) {
     cancelled(jobId);
     const { key, wallet, s } = await requireWallet();
     jobProgress(jobId, { phase: 'saving' });
-    const snap = await latestSnapshot(key);
+    const snap = await latestSnapshot(key, s.network);
     if (!snap) throw new Error('NO_STATE');
     const r = await fn({ key, wallet, s, snap });
-    if (r?.state) await saveSnapshot(key, snap.height, r.state);
+    if (r?.state) await saveSnapshot(key, snap.height, r.state, s.network);
     return r?.out;
   });
 }
@@ -1264,7 +1326,7 @@ async function adoptWaiting({ key, wallet, server, snap, a }) {
   if (!wallet.expectedList(snap.state).length) return [];
   if (a.height() > snap.height) return [];
   const body = a.height() < snap.height
-    ? await rpc.post(server, light.getBlocksRequest(rpc.id(), a.height() + 1, snap.height), { timeoutMs: BLOCKS_TIMEOUT_MS, background: true })
+    ? await rpc.post(server, light.getBlocksRequest(rpc.id(), a.height() + 1, snap.height), { timeoutMs: BLOCKS_TIMEOUT_MS })
     : undefined;
   const out = wallet.adoptFromArchive(snap.state, a, body);
   if (!out.adopted.length) return [];
@@ -1367,9 +1429,9 @@ async function saveSend(rec) {
   }
   const key = await vault.sessionKey();
   if (has && key) stored.sealed = await vault.encrypt(key, enc.encode(JSON.stringify(plain)));
-  else if (has && !rec.sealed) throw new Error('Wallet locked: refusing to save unencrypted payment details');
+  else if (has && !rec.sealed) Object.assign(stored, plain); // no key yet: never drop data
   await db.put(db.STORES.sends, rec.id, stored);
-  notify('send', { send: { ...(key ? rec : stored), prepared: undefined, sealed: undefined } });
+  notify('send', { send: { ...rec, prepared: undefined, sealed: undefined } });
 }
 
 const ACTIVE = ['starting', 'waiting-block', 'preparing', 'rebuilding', 'proving', 'proved', 'submitting', 'needs-lustration'];
@@ -1382,17 +1444,7 @@ async function activeSend(network) {
   return null;
 }
 
-async function ensureNoActivePayment() {
-  for (const id of await db.keys(db.STORES.sends)) {
-    const rec = await db.get(db.STORES.sends,id);
-    if (rec && ACTIVE.includes(rec.status)) throw new Error('Finish or cancel active payments before replacing or resetting the wallet');
-  }
-  if (await offscreenBusyWith()) throw new Error('Wait for the approved payment to finish before resetting the wallet');
-}
-
 async function startSend(req) {
-  return exclusiveNow(async () => {
-  await requireWallet();
   await migrateStorage();
   const network = await currentNetwork();
   const busy = await activeSend(network);
@@ -1416,7 +1468,6 @@ async function startSend(req) {
   await saveSend(rec);
   runSend(rec.id).catch(() => {});
   return rec.id;
-  });
 }
 
 const running = new Set(); // send ids with a step in progress in this worker
@@ -1481,8 +1532,6 @@ function runSend(id) {
       await syncOnce();
       if (await wasCancelled(id)) return;
 
-      const live = await openWallet();
-      if (!live || live.wallet !== wallet || live.s.network !== rec.network) throw new Error('Wallet locked or network changed before preparation');
       const snap = await latestSnapshot(key);
       const out = wallet.prepareSend(
         snap.state, rec.to, rec.amount, rec.fee, Date.now(),
@@ -1711,10 +1760,13 @@ let priceCache = null;
 
 async function fetchPrice() {
   if (priceCache && Date.now() - priceCache.at < PRICE_TTL_MS) return priceCache;
-  const j = await guardedFetch(PRICE_URL, { cache: 'no-store', signal:AbortSignal.timeout(15000) }, {}, readJSON);
+  await rpc.assertRoute(PRICE_URL);
+  const r = await fetch(PRICE_URL, { credentials: 'omit', cache: 'no-store' });
+  if (!r.ok) throw new Error(`price service answered ${r.status}`);
+  const j = await r.json();
   const npt = j['neptune-cash'] || {};
   const tether = j.tether || {};
-  if (!Number.isFinite(npt.usd) || npt.usd<=0) throw new Error('no valid NPT price available');
+  if (!npt.usd) throw new Error('no NPT price available');
   priceCache = {
     at: Date.now(),
     usd: npt.usd,
@@ -1734,8 +1786,11 @@ async function fetchPriceHistory(cur) {
   const vs = cur === 'eur' ? 'eur' : cur === 'gbp' ? 'gbp' : 'usd';
   if (historyCache && historyCache.vs === vs && Date.now() - historyCache.at < HISTORY_TTL_MS) return historyCache;
   const url = `https://api.coingecko.com/api/v3/coins/neptune-cash/market_chart?vs_currency=${vs}&days=7`;
-  const j = await guardedFetch(url, { cache: 'no-store', signal:AbortSignal.timeout(15000) }, {}, readJSON);
-  const raw = (j.prices || []).filter((p) => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]) && p[1]>0);
+  await rpc.assertRoute(url);
+  const r = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+  if (!r.ok) throw new Error(`price service answered ${r.status}`);
+  const j = await r.json();
+  const raw = (j.prices || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
   if (raw.length < 2) throw new Error('no price history');
   // About 64 points is plenty for a small chart.
   const step = Math.max(1, Math.floor(raw.length / 64));
@@ -1755,7 +1810,8 @@ async function requireWallet() {
   await migrateStorage();
   const w = await openWallet();
   if (!w) throw new Error('locked');
-  return w; // Read-only polling must not extend the unlock lifetime.
+  await bumpAutoLock();
+  return w;
 }
 
 /** Start height for a restore: a block height, a date, or the tip. */
@@ -1777,14 +1833,6 @@ async function readContacts(key, network) {
   return box ? JSON.parse(dec.decode(await vault.decrypt(key, box))) : [];
 }
 
-async function readHiddenWatch(key, network) {
-  const box=await db.get(db.STORES.kv,`watchHidden:${network||await currentNetwork()}`);
-  return box?JSON.parse(dec.decode(await vault.decrypt(key,box))):[];
-}
-async function writeHiddenWatch(key,network,ids) {
-  await db.put(db.STORES.kv,`watchHidden:${network}`,await vault.encrypt(key,enc.encode(JSON.stringify(ids))));
-}
-
 async function writeContacts(key, list, network) {
   const n = network || (await currentNetwork());
   await db.put(db.STORES.kv, `contacts:${n}`, await vault.encrypt(key, enc.encode(JSON.stringify(list))));
@@ -1799,141 +1847,12 @@ async function sealOldSends() {
   }
 }
 
-async function genericWatchNotice(id,message) {
-  await chrome.notifications.create(id,{type:'basic',iconUrl:chrome.runtime.getURL('icons/icon128.png'),title:'Escanour watch monitor',message,priority:1});
-}
-function watchBaseline(wallet,snap){return Object.fromEntries(wallet.watchList(snap.state,Date.now()).map(w=>[w.key_short,w.coins.length]));}
-async function saveWatchAlertBaseline(key,wallet,snap,network) {
-  await db.put(db.STORES.kv,`watchAlertBaseline:${network}`,await vault.encrypt(key,enc.encode(JSON.stringify(watchBaseline(wallet,snap)))));
-}
-async function watchAlerts({key,wallet,snap,network}) {
-  const prefs=await settingsStore.load();if(!prefs.watchAlerts||prefs.notifications===false)return;
-  const box=await db.get(db.STORES.kv,`watchAlertBaseline:${network}`);
-  const previous=box?JSON.parse(dec.decode(await vault.decrypt(key,box))):null;
-  const next=watchBaseline(wallet,snap);
-  const found=previous&&Object.entries(next).some(([k,count])=>k in previous&&count>previous[k]);
-  await saveWatchAlertBaseline(key,wallet,snap,network);
-  if(found)await genericWatchNotice(`watch-received:${network}`,'New payments were found for watched addresses. Open the contact activity feed to review them.');
-}
-async function stalledAlert() {
-  const prefs=await settingsStore.load();if(!prefs.watchAlerts||prefs.notifications===false||!(await vault.sessionKey()))return;
-  const st=await status(prefs.network),scan=scanProgress(st,st),key=`watchStalled:${prefs.network}`;
-  if(scan.paused||!scan.stalled){await db.del(db.STORES.kv,key);return;}
-  if(await db.get(db.STORES.kv,key))return;
-  await db.put(db.STORES.kv,key,Date.now());
-  await genericWatchNotice(`watch-stalled:${prefs.network}`,'Block reading has not progressed for three minutes. Open Scans or Node health to investigate.');
-}
-
 const commands = {
-  async touch() { return Boolean(await vault.sessionKey()); },
-  async parametersData() {
-    const {key,wallet,s}=await requireWallet();const snap=await latestSnapshot(key);if(!snap)throw new Error('NO_STATE');
-    const st=await status(s.network), contacts=await readContacts(key,s.network);
-    if(typeof wallet.watchExport!=='function')throw new Error('Wallet modules are out of date. Use the new compiled extension from GitHub Actions.');
-    const metadata=wallet.watchExport(snap.state);
-    const watch=wallet.watchList(snap.state,Date.now()).map(w=>({...w,address:metadata.find(m=>m.id===w.id)?.address}));
-    const groups=portfolios(watch,contacts,snap.height);
-    const activity=await readActivity(key);
-    const active=await latestSend(s.network);
-    const sent=activity.filter(a=>a.kind==='sent');
-    if(active&&!sent.some(a=>a.id===active.id||(a.txId&&a.txId===active.view?.tx_id)))sent.unshift(active);
-    const fullFeed=activityFeed(groups);
-    const publicGroups=groups.map(g=>({...g,addresses:g.addresses.map(({coins,...w})=>w)}));
-    return {network:s.network,theme:s.theme,status:st,scan:scanProgress(st,st),portfolios:publicGroups,feed:fullFeed.slice(0,5000),feedLimited:fullFeed.length>5000,payments:sent.slice(0,100).map(p=>paymentTimeline(p,snap.height)),restore:await readRestorePlan(key,s.network)||null,node:await db.get(db.STORES.kv,`nodeHealth:${s.network}`)||null,alerts:s.watchAlerts===true,authenticator:await authenticator.enabled()};
-  },
-  async scanControl({action}) {
-    if(!['pause','resume','retry'].includes(action))throw new Error('Invalid scan action');
-    const {s}=await requireWallet();
-    pauseRequested=action==='pause';if(pauseRequested)rpc.cancelBackground();
-    await db.put(db.STORES.kv,`scanPaused:${s.network}`,pauseRequested);
-    await setStatus({scanPaused:pauseRequested,syncing:false,...(pauseRequested?{}:{error:null,watchError:null,scanSample:null})},s.network);
-    if(!pauseRequested)scheduleFollowUp();
-    return true;
-  },
-  async setWatchAlerts({enabled}) {
-    const {key,wallet,s}=await requireWallet();
-    await settingsStore.save({watchAlerts:enabled===true});
-    if(enabled===true){const snap=await latestSnapshot(key);if(snap)await saveWatchAlertBaseline(key,wallet,snap,s.network);}
-    return true;
-  },
-  async nodeHealth() {
-    const {s}=await requireWallet();await wasm();const server=settingsStore.serversFor(s).sync;
-    const started=Date.now();let result;
-    try {
-      const info=await commands.serverInfo({url:server});const latencyMs=info.latencyMs;
-      const blocks=[];
-      for(let h=info.height;h>Math.max(0,info.height-4);h--){
-        try{blocks.push(light.blockInfo(await rpc.post(server,light.getBlocksRequest(rpc.id(),h,h),{timeoutMs:10000})));}catch{break;}
-      }
-      const intervals=blocks.slice(1).map((b,i)=>blocks[i].timestamp_ms-b.timestamp_ms).filter(n=>n>0);
-      result={...info,ok:true,host:new URL(server).host,latencyMs,checkedAt:Date.now(),blocks,walletBlocks:blocks.length?true:null,averageBlockMs:intervals.length?intervals.reduce((a,b)=>a+b,0)/intervals.length:null};
-    } catch(e){result={ok:false,checkedAt:Date.now(),error:String(e.message||e).slice(0,200)};}
-    await db.put(db.STORES.kv,`nodeHealth:${s.network}`,result);return result;
-  },
-  async explorerBlock({height}) {
-    const {s}=await requireWallet();const h=Number(height);
-    if(!Number.isSafeInteger(h)||h<1)throw new Error('Enter a block height of 1 or greater');
-    await wasm();return light.blockInfo(await rpc.post(settingsStore.serversFor(s).sync,light.getBlocksRequest(rpc.id(),h,h),{timeoutMs:15000}));
-  },
-  async assistant({question}) { return assistantAnswer(question,await commands.parametersData()); },
-  async authBegin({password}) {
-    const {key}=await requireWallet();await vault.checkPassword(password);return authenticator.begin(key);
-  },
-  async authConfirm({code}) {const {key}=await requireWallet();return authenticator.confirm(key,code);},
-  async authDisable({password}) {await requireWallet();await vault.checkPassword(password);await authenticator.disable();return true;},
-  async backupExport({password}) {
-    const {key,wallet,s}=await requireWallet();const snap=await latestSnapshot(key);if(!snap)throw new Error('NO_STATE');
-    const contacts=(await readContacts(key,s.network)).map(c=>({name:c.name,addresses:(c.addresses||[c]).map(a=>({address:a.address}))}));
-    const watch=wallet.watchExport(snap.state).map(({label,viewingKey,spendKey,from})=>({label,viewingKey,spendKey,from}));
-    return backup.seal({network:s.network,contacts,watch,createdAt:Date.now()},password);
-  },
-  async backupPreview({text,password}) {
-    const {key,s}=await requireWallet();const payload=backup.validate(await backup.unseal(text,password),s.network);
-    const token=crypto.randomUUID();
-    await db.put(db.STORES.kv,'backup:pending',await vault.encrypt(key,enc.encode(JSON.stringify({token,payload,expires:Date.now()+600000}))));
-    return {token,network:s.network,contacts:payload.contacts.length,watch:payload.watch.length};
-  },
-  async backupApply({token}) {
-    return withState(async ({key,wallet,s,snap})=>{
-      const box=await db.get(db.STORES.kv,'backup:pending');if(!box)throw new Error('Preview a backup first');
-      const pending=JSON.parse(dec.decode(await vault.decrypt(key,box)));
-      if(pending.token!==token||pending.expires<Date.now())throw new Error('Import preview expired');
-      const payload=backup.validate(pending.payload,s.network);
-      const contacts=await readContacts(key,s.network);let state=snap.state;
-      for(const c of payload.contacts){
-        const addresses=c.addresses.map(a=>{const address=a.address.trim().toLowerCase();const info=light.addressInfo(address,s.network);if(!info.valid)throw new Error('Backup contains an invalid receiving address');return {address,kind:info.kind};});
-        if(new Set(addresses.map(a=>a.kind)).size!==addresses.length)throw new Error('Contact has duplicate address types');
-        const matches=contacts.filter(old=>(old.addresses||[old]).some(a=>addresses.some(b=>a.address===b.address)));
-        if(matches.length){
-          if(matches.length!==1||addresses.some(a=>!(matches[0].addresses||[matches[0]]).some(b=>a.address===b.address)))throw new Error('Contact conflict: edit overlapping contacts before importing');
-          continue;
-        }
-        contacts.push({id:crypto.randomUUID(),name:c.name,...addresses[0],addresses,createdAt:Date.now()});
-      }
-      const existing=wallet.watchExport(state);
-      for(const w of payload.watch){
-        const found=existing.find(x=>x.viewingKey.toLowerCase()===w.viewingKey.trim().toLowerCase());
-        if(found){if((found.spendKey||'')!==(w.spendKey||''))throw new Error('Watch key conflict: existing spend visibility differs');continue;}
-        state=wallet.watchAdd(state,w.label,w.viewingKey,w.spendKey||undefined,w.from);
-        existing.push(w);
-      }
-      if(contacts.length>1000)throw new Error('Contact limit exceeded');
-      contacts.sort((a,b)=>a.name.localeCompare(b.name));
-      const [contactBox,stateBox]=await Promise.all([vault.encrypt(key,enc.encode(JSON.stringify(contacts))),vault.encrypt(key,state)]);
-      await db.putAcross([{store:db.STORES.kv,key:`contacts:${s.network}`,value:contactBox},{store:db.STORES.snapshots,key:snapKey(s.network,snap.height),value:stateBox}]);
-      snapCache={key,network:s.network,height:snap.height,state};
-      await db.del(db.STORES.kv,'backup:pending');
-      const need=wallet.watchNeeds(state);await setStatus({watchBehind:need?{at:need[0]-1,end:need[1]}:null,watchError:null});
-      notify('watch');scheduleFollowUp();return {out:true};
-    });
-  },
-
   async state() {
     await migrateStorage();
     const s = await settingsStore.load();
     return {
       exists: await vault.exists(),
-      authenticator: await authenticator.enabled(),
       unlocked: Boolean(await vault.sessionKey()),
       settings: s,
       tor: { ...(await torState()), hosts: torHosts(s) },
@@ -1958,14 +1877,12 @@ const commands = {
   },
 
   async create({ password, phrase, network, birthday, birthdayDate, restoreMode = 'private', nodeUrl }) {
-    return exclusiveNow(async () => {
-    await ensureNoActivePayment();
     if (!password || password.length < 10) throw new Error('Use a password of at least 10 characters');
     await wasm();
     const clean = String(phrase).trim().toLowerCase().split(/\s+/).join(' ');
     const wallet = new light.LightWallet(clean, network); // validates the phrase
     let prev = await settingsStore.load();
-    const restoring = (birthday!==undefined && birthday!==null && birthday!=='') || Boolean(birthdayDate);
+    const restoring = Boolean(birthday || birthdayDate);
     if (restoring && restoreMode === 'node') {
       // Fast and private: the user's own node does the lookups and keeps
       // serving this network afterwards.
@@ -1977,7 +1894,6 @@ const commands = {
     // New wallet: start at the tip. Restore: start at the birthday (height or date).
     const start = await startHeight(server, { birthday, birthdayDate });
     const state = await initialState(wallet, server, start);
-    const premine = start===0 && wallet.summary(state,Date.now()).utxos.length>0;
     wallet.free?.();
     dropWallet();
     // The spend index and the archive are public chain data, not the wallet's: keep them.
@@ -1988,30 +1904,29 @@ const commands = {
     await settingsStore.save({ ...prev, network, birthday: null });
     const key = await vault.create(password, clean);
     await saveSnapshot(key, start, state, network);
-    const fastPending = restoring && ['fast', 'node'].includes(restoreMode) && !premine ? restoreMode : null;
-    await saveRestorePlan(key,network,{mode:restoreMode,pending:Boolean(fastPending),failure:premine&&restoreMode!=='private'?'premine-full-scan':null,fallback:premine?'private':null});
+    const fastPending = restoring && ['fast', 'node'].includes(restoreMode) ? restoreMode : null;
     await setStatus({ height: start, startHeight: start, restored: restoring, syncing: true, fastPending }, network);
     await bumpAutoLock();
     notify('walletChanged');
     syncOnce().catch(() => {});
     return { start };
-    });
   },
 
-  async unlock({ password, authCode }) {
-    return exclusiveNow(async () => {
+  async unlock({ password }) {
     if (!password) throw new Error('Enter your password');
     if (!(await vault.exists())) throw new Error('No wallet on this device. Create or restore one.');
-    await vault.unlock(password, key => authenticator.authorize(key, authCode));
+    await vault.unlock(password);
     await bumpAutoLock();
     sealOldSends().catch(() => {});
     syncOnce().catch(() => {}).finally(() => resumeSends().catch(() => {}));
     return true;
-    });
   },
 
   async lock() {
-    return exclusiveNow(async () => { await vault.lock(); dropWallet(); notify('locked'); return true; });
+    // Stop fetches before freeing the WASM wallet used by the current run.
+    return exclusiveNow(async () => {
+      await vault.lock(); dropWallet(); notify('locked'); return true;
+    });
   },
 
   /** Everything the home screen shows, from one decrypted state. */
@@ -2030,8 +1945,8 @@ const commands = {
       activity,
       contacts,
       privacy,
-      watch: wallet.watchList(snap.state, Date.now()).map(w=>({...w,coinCount:w.coins.length,coins:w.coins.slice(0,6)})),
-      hiddenWatchIds:await readHiddenWatch(key),
+      watch: decorateWatch(wallet.watchList(snap.state, Date.now()), (await watchDataFor(key, wallet, snap)).prefs),
+      height: snap.height,
     };
   },
 
@@ -2078,6 +1993,8 @@ const commands = {
   },
 
   async sync() {
+    const s = await settingsStore.load();
+    if (s.tor && !(await torState()).required) await applyTor();
     await syncOnce();
     resumeSends().catch(() => {});
     return status();
@@ -2123,9 +2040,7 @@ const commands = {
    *  the wallet can use (fast restore via the UTXO index). */
   async serverInfo({ url }) {
     const server = rpc.normalizeServer(url);
-    const pingStarted = Date.now();
     const height = await fetchHeight(server);
-    const latencyMs = Date.now() - pingStarted;
     const probe = async (method, params) => {
       try {
         const text = await rpc.post(server, JSON.stringify({ jsonrpc: '2.0', id: rpc.id(), method, params }), { timeoutMs: 15_000 });
@@ -2135,21 +2050,7 @@ const commands = {
       }
     };
     const net = await probe('node_network', []);
-    await wasm();
-    if(typeof light.fastProbeRequests!=='function'||typeof light.validateFastProbeResponse!=='function')throw new Error('Wallet modules are out of date. Use the new compiled extension from GitHub Actions.');
-    const firstProbeId=rpc.id();rpc.id();const requests=light.fastProbeRequests(firstProbeId);
-    const capabilities={};
-    for(const [name,body] of Object.entries(requests)) {
-      try {
-        const text=await rpc.post(server,body,{timeoutMs:BLOCKS_TIMEOUT_MS});
-        light.validateFastProbeResponse(name,text);
-        const parsed=JSON.parse(text);if(!Object.hasOwn(parsed,'result'))throw new Error('Response has no result');
-        capabilities[name]={supported:true,error:null};
-      } catch(e) {
-        const message=String(e.message||e);
-        capabilities[name]={supported:/-32601|method not found|index.*(?:disabled|not enabled|not available)/i.test(message)?false:null,error:message.slice(0,300)};
-      }
-    }
+    const flags = await probe('utxoindex_blockHeightsByFlags', [[]]);
     let host = '';
     try {
       host = new URL(server).hostname;
@@ -2157,11 +2058,10 @@ const commands = {
       /* keep empty */
     }
     return {
-      height, latencyMs,
+      height,
       network: typeof net?.network === 'string' ? net.network : null,
       own: ['localhost', '127.0.0.1'].includes(host),
-      fastRestore: capabilities.flags.supported===false||capabilities.proofs.supported===false?false:capabilities.flags.supported===true&&capabilities.proofs.supported===true?true:null,
-      fastCapabilities:capabilities,
+      fastRestore: flags !== undefined,
       // neptune-core has no endpoint yet for proving help (a proof collection
       // without chunk data, or lock-script-only proving); every send is a
       // full proof collection made in the browser.
@@ -2182,7 +2082,6 @@ const commands = {
   async send(req) {
     await requireWallet();
     await wasm();
-    if (await db.get(db.STORES.kv, `scanPaused:${await currentNetwork()}`)) throw new Error('Resume scanning before sending');
     const info = light.addressInfo(String(req.to || ''), await currentNetwork());
     if (!info.valid) throw new Error(info.error || 'Not a valid address');
     return startSend({ ...req, toKind: info.kind });
@@ -2209,41 +2108,43 @@ const commands = {
     return readContacts(key);
   },
 
-  async saveContact({ id, name, address, address2 }) {
+  async saveContact({ id, name, address, addresses }) {
     return exclusiveNow(async () => {
-    const { key } = await requireWallet();
-    await wasm();
-    const clean = String(address || '').trim().toLowerCase();
-    const label = String(name || '').trim().slice(0, 40);
-    if (!label) throw new Error('NAME_REQUIRED');
-    const info = light.addressInfo(clean, await currentNetwork());
-    if (!info.valid) throw new Error(info.error || 'Not a valid address');
-    const second = String(address2 || '').trim().toLowerCase();
-    const addresses = [{ address: clean, kind: info.kind }];
-    if (second) {
-      const extra = light.addressInfo(second, await currentNetwork());
-      if (!extra.valid) throw new Error(extra.error || 'Not a valid second address');
-      if (extra.kind === info.kind) throw new Error('Use one Generation and one Hybrid address');
-      addresses.push({ address: second, kind: extra.kind });
-    }
-    const list = await readContacts(key);
-    if (list.some((c) => c.id !== id && (c.addresses || [c]).some((a) => addresses.some((b) => a.address === b.address)))) throw new Error('DUPLICATE');
-    if (list.length >= 1000 && !list.some(c=>c.id===id)) throw new Error('Contact limit exceeded');
-    const existing = list.find((c) => c.id === id);
-    if (existing) Object.assign(existing, { name: label, address: clean, kind: info.kind, addresses, updatedAt: Date.now() });
-    else list.push({ id: crypto.randomUUID(), name: label, address: clean, kind: info.kind, addresses, createdAt: Date.now() });
-    list.sort((a, b) => a.name.localeCompare(b.name));
-    await writeContacts(key, list);
-    return list;
+      const { key, s } = await requireWallet();
+      await wasm();
+      const label = String(name || '').trim().slice(0, 40);
+      if (!label) throw new Error('NAME_REQUIRED');
+      const inputs = Array.isArray(addresses) ? addresses : [address];
+      const clean = inputs.map((a) => String(typeof a === 'object' ? a.address : a || '').trim().toLowerCase()).filter(Boolean);
+      if (!clean.length || clean.length > 2 || new Set(clean).size !== clean.length) throw new Error('Enter one or two different addresses');
+      const entries = clean.map((address) => {
+        const info = light.addressInfo(address, s.network);
+        if (!info.valid) throw new Error(info.error || 'Not a valid address');
+        return { address, kind: info.kind };
+      });
+      if (entries.length === 2 && (new Set(entries.map((a) => a.kind)).size !== 2 || entries.some((a) => !['generation', 'ec-hybrid'].includes(a.kind)))) {
+        throw new Error('Use one Generation address and one EC Hybrid address');
+      }
+      const list = await readContacts(key, s.network);
+      if (list.some((c) => c.id !== id && contactAddresses(c).some((a) => clean.includes(a.address)))) throw new Error('DUPLICATE');
+      const existing = list.find((c) => c.id === id);
+      const values = { name: label, addresses: entries, address: entries[0].address, kind: entries[0].kind, updatedAt: Date.now() };
+      if (existing) Object.assign(existing, values);
+      else list.push({ id: crypto.randomUUID(), ...values, createdAt: Date.now() });
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      await writeContacts(key, list, s.network);
+      notify('contacts');
+      return list;
     });
   },
 
   async deleteContact({ id }) {
     return exclusiveNow(async () => {
-    const { key } = await requireWallet();
-    const list = (await readContacts(key)).filter((c) => c.id !== id);
-    await writeContacts(key, list);
-    return list;
+      const { key, s } = await requireWallet();
+      const list = (await readContacts(key, s.network)).filter((c) => c.id !== id);
+      await writeContacts(key, list, s.network);
+      notify('contacts');
+      return list;
     });
   },
 
@@ -2289,7 +2190,7 @@ const commands = {
   },
 
   async saveSettings(patch) {
-    const clean = settingsStore.validatePatch(patch);
+    const clean = { ...patch };
     if (clean.servers) {
       const prev = await settingsStore.load();
       const servers = { ...prev.servers };
@@ -2302,6 +2203,7 @@ const commands = {
       clean.servers = servers;
     }
     delete clean.network; // use switchNetwork
+    if (clean.tor === true) { rpc.interrupt(); await setTorState({ state: 'connecting', port: Number(clean.torPort) || 9150 }); }
     const saved = await settingsStore.save(clean);
     // Servers or Tor changed: the proxy script must name the right hosts.
     if ('tor' in clean || 'torPort' in clean || clean.servers) await applyTor({ check: 'tor' in clean || 'torPort' in clean }).catch(() => {});
@@ -2349,16 +2251,12 @@ const commands = {
   },
 
   /** Scan again from an earlier point: finds payments a restore without a date missed. */
-  async rescan({ birthday, birthdayDate, restoreMode }) {
-    if(restoreMode && !['private','fast','node'].includes(restoreMode)) throw new Error('Invalid restore mode');
-    await ensureNoActivePayment();
+  async rescan({ birthday, birthdayDate }) {
     const { key, wallet, s } = await requireWallet();
     const server = settingsStore.serversFor(s).sync;
     if (!server) throw new Error('NEED_SERVER');
     const start = await startHeight(server, { birthday, birthdayDate });
     await exclusiveNow(async () => {
-      const current = await requireWallet();
-      if(current.wallet !== wallet || current.s.network !== s.network) throw new Error('Wallet or network changed. Try the rescan again.');
       const old = await latestSnapshot(key);
       let state = await initialState(wallet, server, start);
       // Waiting coins and watch-only addresses survive the new scan.
@@ -2376,20 +2274,12 @@ const commands = {
       // A scan from genesis that already found premine coins stays a full
       // scan: the fast restore cannot see unannounced coins.
       const premine = start <= 0 && wallet.summary(state, Date.now()).utxos.length > 0;
-      const selected = restoreMode || (local?'node':'private');
-      const fastPending = start <= 1 && selected!=='private' && !premine ? selected : null;
-      await saveRestorePlan(key,s.network,{mode:selected,pending:Boolean(fastPending),failure:premine&&selected!=='private'?'premine-full-scan':null});
-      await db.put(db.STORES.kv, `scanPaused:${s.network}`, false); pauseRequested=false;
-      await setStatus({ height: start, startHeight: start, syncing: true, error: null, restored: true, fastPending, fastFailed:premine&&selected!=='private'?'premine-full-scan':null, fastFailureDetail:null, watchError:null, scanPaused:false });
+      const fastPending = start <= 1 && local && !premine ? 'node' : null;
+      await setStatus({ height: start, startHeight: start, syncing: true, error: null, restored: true, fastPending, fastFailed: null });
     });
     syncOnce().catch(() => {});
     return { start };
   },
-
-  async restoreCurrent({mode='private'}) {
-    const {s}=await requireWallet();
-    if(mode==='node' && !isLocalHost(new URL(settingsStore.serversFor(s).sync).hostname))throw new Error('Configure your local node in Servers before choosing this option');
-    return commands.rescan({birthday:0,restoreMode:mode}); },
 
   async heightForDate({ date }) {
     const s = await settingsStore.load();
@@ -2398,56 +2288,71 @@ const commands = {
 
   // ------------------------------------------------------- watch-only --
 
-  async watchSetHidden({id,hidden}) {
-    return withState(async({key,wallet,s,snap})=>{
-      const number=Number(id);if(!Number.isSafeInteger(number)||!wallet.watchList(snap.state,Date.now()).some(w=>w.id===number))throw new Error('Watched address not found');
-      const ids=new Set(await readHiddenWatch(key,s.network));if(hidden===true)ids.add(number);else ids.delete(number);
-      await writeHiddenWatch(key,s.network,[...ids]);notify('watch');return {out:true};
-    });
-  },
-
   async watchList() {
     const { key, wallet } = await requireWallet();
     const snap = await latestSnapshot(key);
     if (!snap) throw new Error('NO_STATE');
     const st = await status();
-    const need = wallet.watchNeeds(snap.state);
-    return { list: wallet.watchList(snap.state, Date.now()).map(w=>({...w,coinCount:w.coins.length,coins:w.coins.slice(0,6)})), hiddenIds:await readHiddenWatch(key), height: snap.height, behind: need ? { at: need[0] - 1, end: need[1] } : null, error: st.watchError || null };
+    return { list: decorateWatch(wallet.watchList(snap.state, Date.now()), (await watchDataFor(key, wallet, snap)).prefs), height: snap.height, behind: st.watchBehind || null, fast: st.watchFast || null, error: st.watchError || null };
   },
 
-  /** `from`: 'start' (block 1), 'now' (next block) or a block height. */
-  async watchAdd({ label, viewingKey, spendKey, viewingKey2, spendKey2, from, jobId }) {
-    await withState(async ({ wallet, snap }) => {
-      let fromHeight = 1;
-      if (from === 'now') fromHeight = snap.height + 1;
-      else if (from !== 'start' && from != null && from !== '') {
-        fromHeight = Math.floor(Number(from));
-        if (!Number.isFinite(fromHeight) || fromHeight < 1) throw new Error('Not a block height');
-      }
-      const spend = spendKey && String(spendKey).trim() ? String(spendKey).trim() : undefined;
-      let state = wallet.watchAdd(snap.state, String(label || ''), String(viewingKey || ''), spend, fromHeight);
-      if (String(viewingKey2 || '').trim()) {
-        state = wallet.watchAdd(state, String(label || ''), String(viewingKey2).trim(), String(spendKey2 || '').trim() || undefined, fromHeight);
-      }
-      // Tell the next sync run there is catching up to do.
-      const need = wallet.watchNeeds(state);
-      await setStatus({ watchBehind: need ? { at: need[0] - 1, end: need[1] } : null, watchError: null });
-      return { state };
+  /** Add one independent watch entry and persist it before starting its scan. */
+  async watchAdd({ label, viewingKey, spendKey, from, mode = 'private', nodeUrl, contactId, jobId }) {
+    if (!['private', 'fast', 'node'].includes(mode)) throw new Error('Unknown scan mode');
+    const server = mode === 'node' ? rpc.normalizeServer(String(nodeUrl || '')) : undefined;
+    if (server) {
+      const s = await settingsStore.load();
+      await settingsStore.save({ watchNodes: [...new Set([...(s.watchNodes || []), server])] });
+      if (s.tor) await applyTor({ check: false });
+    }
+    await withState(async ({ key, wallet, s, snap }) => {
+      let fromHeight = from === 'now' ? snap.height + 1 : from === 'start' || !from ? 1 : Number(from);
+      if (!Number.isSafeInteger(fromHeight) || fromHeight < 1) throw new Error('Not a block height');
+      const data = await watchDataFor(key, wallet, snap, s.network);
+      const id = data.nextId;
+      const record = { id, label: String(label || '').trim().slice(0, 40), viewingKey: String(viewingKey || '').trim().toLowerCase(),
+        spendKey: String(spendKey || '').trim() || null, fromHeight };
+      const records = [...data.records, record];
+      const state = wallet.watchReconcile(snap.state, JSON.stringify(records));
+      cancelled(jobId);
+      data.records = records; data.nextId++;
+      data.prefs[id] = { mode, server, contactId: contactId || null, paused: false, hidden: false };
+      await writeWatchData(key, data, s.network);
+      await setStatus({ watchBehind: { at: Math.min(fromHeight - 1, snap.height), end: snap.height }, watchError: null });
+      return { state, out: id };
     }, jobId);
-    notify('watch');
-    scheduleFollowUp();
+    notify('watch'); scheduleFollowUp();
+    return true;
+  },
+
+  async watchUpdate({ id, paused, hidden, label }) {
+    await withState(async ({ key, wallet, s, snap }) => {
+      const data = await watchDataFor(key, wallet, snap, s.network);
+      const record = data.records.find((a) => a.id === Number(id));
+      if (!record) throw new Error('Watch address no longer exists');
+      const pref = data.prefs[id] ||= { mode: 'private' };
+      if (typeof paused === 'boolean') pref.paused = paused;
+      if (typeof hidden === 'boolean') pref.hidden = hidden;
+      if (typeof label === 'string') record.label = label.trim().slice(0, 40);
+      const state = wallet.watchReconcile(snap.state, JSON.stringify(data.records));
+      await writeWatchData(key, data, s.network);
+      await setStatus({ watchBehind: { at: 0, end: snap.height }, watchError: null });
+      return { state };
+    });
+    notify('watch'); scheduleFollowUp();
     return true;
   },
 
   async watchRemove({ id }) {
     await withState(async ({ key, wallet, s, snap }) => {
-      await writeHiddenWatch(key,s.network,(await readHiddenWatch(key,s.network)).filter(x=>x!==Number(id)));
-      const state = wallet.watchRemove(snap.state, Number(id));
-      const need = wallet.watchNeeds(state);
-      await setStatus({ watchBehind: need ? { at: need[0] - 1, end: need[1] } : null, watchError: null });
-      return { state };
+      const data = await watchDataFor(key, wallet, snap, s.network);
+      data.records = data.records.filter((a) => a.id !== Number(id));
+      delete data.prefs[id];
+      await writeWatchData(key, data, s.network);
+      await db.del(db.STORES.kv, fastWatchKey(s.network, id));
+      return { state: wallet.watchReconcile(snap.state, JSON.stringify(data.records)) };
     });
-    notify('watch');
+    notify('watch'); scheduleFollowUp();
     return true;
   },
 
@@ -2573,8 +2478,6 @@ const commands = {
   },
 
   async reset() {
-    return exclusiveNow(async () => {
-    await ensureNoActivePayment();
     await vault.lock();
     dropWallet();
     dropArchive();
@@ -2584,15 +2487,12 @@ const commands = {
     await settingsStore.save({ ...s, birthday: null, network: 'main' });
     await chrome.storage.session.clear();
     await closeOffscreenIfIdle().catch(() => {});
-    notify('locked');
     return true;
-    });
   },
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.target !== 'background') return false;
-  if (!trustedMessage(_sender, chrome.runtime.id, msg)) { sendResponse({ok:false,error:'Unauthorized extension message'}); return false; }
 
   // From the offscreen page.
   if (msg.type === 'proveProgress') {
@@ -2626,29 +2526,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   // From the popup.
-  const fn = Object.hasOwn(commands, msg.cmd) ? commands[msg.cmd] : null;
+  const fn = commands[msg.cmd];
   if (!fn) {
     sendResponse({ ok: false, error: `unknown command ${msg.cmd}` });
     return false;
   }
-  keepAlive(async () => {
-    const args = msg.args || {};
-    const sensitive = new Set(['send','retrySend','acceptLustrationAndRetry','revealPhrase','viewingKeys','backupExport','backupPreview','backupApply','authDisable','rescan','restoreCurrent','reset','create']);
-    if (sensitive.has(msg.cmd) && await authenticator.enabled()) {
-      const key = await vault.sessionKey();
-      if (!key) throw new Error('Unlock the wallet before this action');
-      await authenticator.authorize(key,args.authCode);
-    }
-    const clean = {...args}; delete clean.authCode;
-    if (msg.cmd === 'unlock') clean.authCode = args.authCode;
-    const interactive = new Set(['touch','send','retrySend','acceptLustrationAndRetry','saveSettings','saveContact','deleteContact','setNote','watchAdd','watchRemove','watchSetHidden','scanControl','setWatchAlerts','authBegin','authConfirm','authDisable','backupExport','backupPreview','backupApply','claimRegister','claimRemove','switchNetwork','rescan','restoreCurrent','archiveSet']);
-    if (interactive.has(msg.cmd) && await vault.sessionKey()) await bumpAutoLock();
-    const epoch = walletEpoch;
-    const result = await fn(clean);
-    if(msg.cmd==='state' && (epoch!==walletEpoch || !(await vault.sessionKey()))) {result.unlocked=false;result.send=null;}
-    if (['home','summary','privacy','watchList','activity','parametersData','assistant','contacts','saveContact','deleteContact','latestSend','maxSendable','waiting','claimCheck','findPremine','receive','viewingKeys','revealPhrase','backupExport','backupPreview','authBegin','authConfirm'].includes(msg.cmd) && (epoch !== walletEpoch || !(await vault.sessionKey()))) throw new Error('locked');
-    return result;
-  })
+  keepAlive(() => fn(msg.args || {}))
     .then((data) => sendResponse({ ok: true, data }))
     .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
   return true; // async response
@@ -2678,14 +2561,13 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'autolock') {
-    await exclusiveNow(async () => { await vault.lock(); dropWallet(); notify('locked'); });
+    await commands.lock();
     return;
   }
   if (alarm.name === 'sync') {
     if (!(await vault.sessionKey())) return;
     await maybeRecheckTor().catch(() => {});
     await syncOnce().catch(() => {});
-    await stalledAlert().catch(() => {});
     await resumeSends().catch(() => {});
   }
 });

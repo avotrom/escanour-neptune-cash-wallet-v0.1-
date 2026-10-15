@@ -10,7 +10,7 @@ use light_core::neptune_consensus::type_scripts::native_currency_amount::NativeC
 use light_core::send::{self, PreparedSend, SendRequest};
 use light_core::state::WalletState;
 use light_core::{archive, claim, jobs, parse_network, rpc, sync, watch};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 fn js_err(e: anyhow::Error) -> JsError {
@@ -39,6 +39,16 @@ fn state_and(st: &WalletState, field: &str, value: &JsValue) -> Result<JsValue, 
         .map_err(|_| JsError::new("set state"))?;
     js_sys::Reflect::set(&out, &field.into(), value).map_err(|_| JsError::new("set field"))?;
     Ok(out.into())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchRegistration {
+    id: u64,
+    label: String,
+    viewing_key: String,
+    spend_key: Option<String>,
+    from_height: u64,
 }
 
 #[wasm_bindgen(start)]
@@ -89,20 +99,6 @@ pub fn is_not_confirmable(error_text: &str) -> bool {
 #[wasm_bindgen(js_name = maxBlocksPerCall)]
 pub fn max_blocks_per_call() -> f64 {
     rpc::MAX_BLOCKS_PER_CALL as f64
-}
-
-/// Fast-restore probes use the same typed parameter encodings as recovery.
-#[wasm_bindgen(js_name = fastProbeRequests)]
-pub fn fast_probe_requests(id: f64) -> Result<JsValue, JsError> {
-    let (flags, proofs) = light_core::fast::capability_requests(id as u64).map_err(js_err)?;
-    #[derive(Serialize)]
-    struct Probes { flags: String, proofs: String }
-    to_js(&Probes { flags, proofs })
-}
-
-#[wasm_bindgen(js_name = validateFastProbeResponse)]
-pub fn validate_fast_probe_response(kind: &str, body: &str) -> Result<(), JsError> {
-    light_core::fast::validate_capability_response(kind, body).map_err(js_err)
 }
 
 // ------------------------------- wallet -------------------------------------
@@ -411,38 +407,15 @@ impl LightWallet {
         for e in old.expected {
             claim::register(&mut new, e);
         }
-        new.watch = old.watch;
-        for w in &mut new.watch {
-            w.coins.clear();
-            w.scanned_to = w.from_height - 1;
-            w.cursor_hash = None;
+        for mut w in old.watch {
+            if w.scanned_to > new.height && w.scanned_to >= w.from_height {
+                w.coins.clear(); w.scanned_to = w.from_height - 1; w.cursor_hash = None;
+            }
+            if !new.watch.iter().any(|x| x.viewing_key == w.viewing_key) {
+                new.watch.push(w);
+            }
         }
         new.to_bytes().map_err(js_err)
-    }
-
-    /// Preserve the latest watch registrations across a chain rollback.
-    /// Reuse rollback coin data only for the exact same viewing/spend key.
-    #[wasm_bindgen(js_name = reconcileWatch)]
-    pub fn reconcile_watch(&self, latest: &[u8], rollback: &[u8]) -> Result<Vec<u8>, JsError> {
-        let latest = WalletState::from_bytes(latest).map_err(js_err)?;
-        let mut rollback = WalletState::from_bytes(rollback).map_err(js_err)?;
-        rollback.watch = latest.watch.into_iter().map(|mut current| {
-            if let Some(saved) = rollback.watch.iter().find(|saved|
-                saved.viewing_key == current.viewing_key
-                && saved.receiver_preimage == current.receiver_preimage
-                && saved.from_height == current.from_height
-            ) {
-                current.coins = saved.coins.clone();
-                current.scanned_to = saved.scanned_to;
-                current.cursor_hash = saved.cursor_hash;
-            } else {
-                current.coins.clear();
-                current.scanned_to = current.from_height - 1;
-                current.cursor_hash = None;
-            }
-            current
-        }).collect();
-        rollback.to_bytes().map_err(js_err)
     }
 
     /// Viewing keys of this wallet's two addresses (index 0), to follow them
@@ -512,21 +485,6 @@ impl LightWallet {
         st.to_bytes().map_err(js_err)
     }
 
-    /// Sensitive watch configuration, used only for encrypted backup and address matching.
-    #[wasm_bindgen(js_name = watchExport)]
-    pub fn watch_export(&self, state: &[u8]) -> Result<JsValue, JsError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Entry { id: u64, label: String, viewing_key: String, spend_key: Option<String>, from: u64, address: String }
-        let st = WalletState::from_bytes(state).map_err(js_err)?;
-        let mut entries = Vec::new();
-        for w in &st.watch {
-            let address = w.key(st.network).map_err(js_err)?.address().to_bech32m(st.network).map_err(js_err)?;
-            entries.push(Entry { id: w.id, label: w.label.clone(), viewing_key: w.viewing_key.clone(), spend_key: w.receiver_preimage.map(|x| x.to_hex()), from: w.from_height, address });
-        }
-        to_js(&entries)
-    }
-
     /// `[WatchView]`, see `light_core::watch::view`.
     #[wasm_bindgen(js_name = watchList)]
     pub fn watch_list(&self, state: &[u8], now_ms: f64) -> Result<JsValue, JsError> {
@@ -550,6 +508,70 @@ impl LightWallet {
         let mut st = WalletState::from_bytes(state).map_err(js_err)?;
         let blocks = rpc::parse_blocks(blocks_body).map_err(js_err)?;
         let result = sync::watch_catch_up(&mut st, blocks).map_err(js_err)?;
+        state_and(&st, "result", &to_js(&result)?)
+    }
+
+    /// Durable registrations are encrypted separately from rollback snapshots.
+    #[wasm_bindgen(js_name = watchRegistry)]
+    pub fn watch_registry(&self, state: &[u8]) -> Result<JsValue, JsError> {
+        let st = WalletState::from_bytes(state).map_err(js_err)?;
+        let registrations: Vec<_> = st.watch.iter().map(|a| WatchRegistration {
+            id: a.id, label: a.label.clone(), viewing_key: a.viewing_key.clone(),
+            spend_key: a.receiver_preimage.map(|d| d.to_hex()), from_height: a.from_height,
+        }).collect();
+        to_js(&registrations)
+    }
+
+    #[wasm_bindgen(js_name = watchReconcile)]
+    pub fn watch_reconcile(&self, state: &[u8], registrations: &str) -> Result<Vec<u8>, JsError> {
+        let mut st = WalletState::from_bytes(state).map_err(js_err)?;
+        let regs: Vec<WatchRegistration> = serde_json::from_str(registrations)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        if regs.len() > watch::MAX_WATCH { return Err(JsError::new("too many watch-only addresses")); }
+        let mut accounts = Vec::with_capacity(regs.len());
+        for r in regs {
+            let fresh = watch::WatchAccount::new(r.id, &r.label, &r.viewing_key,
+                r.spend_key.as_deref(), r.from_height, self.keys.network()).map_err(js_err)?;
+            if accounts.iter().any(|a: &watch::WatchAccount| a.id == fresh.id || a.viewing_key == fresh.viewing_key) {
+                return Err(JsError::new("this address is already watched"));
+            }
+            let previous = st.watch.iter().find(|a| a.id == fresh.id && a.viewing_key == fresh.viewing_key
+                && a.from_height == fresh.from_height && a.receiver_preimage == fresh.receiver_preimage);
+            let mut account = previous.cloned().unwrap_or_else(|| fresh.clone());
+            account.label = fresh.label;
+            if account.scanned_to > st.height && account.scanned_to >= account.from_height {
+                account.coins.clear();
+                account.scanned_to = account.from_height - 1;
+                account.cursor_hash = None;
+            }
+            accounts.push(account);
+        }
+        st.watch = accounts;
+        st.to_bytes().map_err(js_err)
+    }
+
+    /// Paused accounts retain their cursor even when the main wallet advances.
+    #[wasm_bindgen(js_name = applyBlocksWatching)]
+    pub fn apply_blocks_watching(&self, state: &[u8], body: &str, ids: &str) -> Result<JsValue, JsError> {
+        let mut st = WalletState::from_bytes(state).map_err(js_err)?;
+        let ids: Vec<u64> = serde_json::from_str(ids).map_err(|e| JsError::new(&e.to_string()))?;
+        let all = st.watch.clone();
+        st.watch.retain(|a| ids.contains(&a.id));
+        let result = sync::apply_blocks(&mut st, &self.keys, rpc::parse_blocks(body).map_err(js_err)?).map_err(js_err)?;
+        let scanned = std::mem::take(&mut st.watch);
+        st.watch = all.into_iter().map(|a| scanned.iter().find(|b| a.id == b.id).cloned().unwrap_or(a)).collect();
+        state_and(&st, "result", &to_js(&result)?)
+    }
+
+    #[wasm_bindgen(js_name = watchCatchUpFor)]
+    pub fn watch_catch_up_for(&self, state: &[u8], body: &str, ids: &str) -> Result<JsValue, JsError> {
+        let mut st = WalletState::from_bytes(state).map_err(js_err)?;
+        let ids: Vec<u64> = serde_json::from_str(ids).map_err(|e| JsError::new(&e.to_string()))?;
+        let all = st.watch.clone();
+        st.watch.retain(|a| ids.contains(&a.id));
+        let result = sync::watch_catch_up(&mut st, rpc::parse_blocks(body).map_err(js_err)?).map_err(js_err)?;
+        let scanned = std::mem::take(&mut st.watch);
+        st.watch = all.into_iter().map(|a| scanned.iter().find(|b| a.id == b.id).cloned().unwrap_or(a)).collect();
         state_and(&st, "result", &to_js(&result)?)
     }
 
@@ -839,11 +861,6 @@ impl FastRestoreJs {
         }
     }
 
-    #[wasm_bindgen(js_name = setChunkSize)]
-    pub fn set_chunk_size(&mut self, size: u32) {
-        self.inner.set_chunk_size(size as usize);
-    }
-
     /// The next heights-by-flags request, or `undefined` when done.
     #[wasm_bindgen(js_name = flagsRequest)]
     pub fn flags_request(
@@ -1086,5 +1103,41 @@ impl ArchiveJs {
     /// accumulator's commitments).
     pub fn check(&self) -> Result<(), JsError> {
         self.inner.check().map_err(js_err)
+    }
+}
+
+/// Opt-in watch-only index scan; checkpoint bytes never leave encrypted storage.
+#[wasm_bindgen(js_name = WatchFastScan)]
+pub struct WatchFastScanJs { inner: light_core::watch_fast::IndexedWatch }
+
+#[wasm_bindgen(js_class = WatchFastScan)]
+impl WatchFastScanJs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(state: &[u8], id: f64) -> Result<WatchFastScanJs, JsError> {
+        let st = WalletState::from_bytes(state).map_err(js_err)?;
+        Ok(Self { inner: light_core::watch_fast::IndexedWatch::new(&st, id as u64).map_err(js_err)? })
+    }
+    #[wasm_bindgen(js_name = fromBytes)]
+    pub fn from_bytes(bytes: &[u8]) -> Result<WatchFastScanJs, JsError> {
+        Ok(Self { inner: light_core::watch_fast::IndexedWatch::from_bytes(bytes).map_err(js_err)? })
+    }
+    #[wasm_bindgen(js_name = toBytes)]
+    pub fn to_bytes(&self) -> Result<Vec<u8>, JsError> { self.inner.to_bytes().map_err(js_err) }
+    pub fn height(&self) -> f64 { self.inner.height() as f64 }
+    pub fn found(&self) -> f64 { self.inner.found() as f64 }
+    #[wasm_bindgen(js_name = flagsRequest)]
+    pub fn flags_request(&self, id: f64) -> Result<String, JsError> { self.inner.flags_request(id as u64).map_err(js_err) }
+    pub fn heights(&self, body: &str, spends: bool) -> Result<Vec<f64>, JsError> {
+        Ok(self.inner.heights(body, spends).map_err(js_err)?.into_iter().map(|h| h as f64).collect())
+    }
+    #[wasm_bindgen(js_name = spentRequest)]
+    pub fn spent_request(&self, id: f64, offset: f64) -> Result<Option<String>, JsError> {
+        self.inner.spent_request(id as u64, offset as usize).map_err(js_err)
+    }
+    pub fn scan(&mut self, body: &str) -> Result<(), JsError> { self.inner.scan(body).map_err(js_err) }
+    pub fn finish(self, state: &[u8], anchor: &str) -> Result<Vec<u8>, JsError> {
+        let mut st = WalletState::from_bytes(state).map_err(js_err)?;
+        self.inner.finish(&mut st, anchor).map_err(js_err)?;
+        st.to_bytes().map_err(js_err)
     }
 }

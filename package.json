@@ -1,12 +1,9 @@
 {
-  "name": "neptune-light-source-checks",
-  "version": "0.22.0",
+  "name": "escanour-extension-checks",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
-    "check:js": "node scripts/check-js.cjs"
+    "test": "node --test tests/*.test.mjs",
+    "check": "node tests/check-syntax.mjs"
   }
 }

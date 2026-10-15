@@ -1,15 +1,13 @@
-> **0.22.0 GitHub source package.** Wallet tools and authenticator codes are in Parameters. `.github/workflows/build.yml` runs compilation checks and builds without unit tests. Upload this folder’s contents at your repository root, including `.github/`, then download the compiled extension from Actions. This is uncompiled source; see `CHANGES-0.22.0.md` and `docs/SECURITY.md`.
+# Escanour Neptune Wallet 0.21.0
 
-> Latest source update: **0.22.0**. Features and authenticator are integrated into Parameters. See `CHANGES-0.22.0.md` for recovery repairs, star masking, added languages and build requirements.
-
-# Escanour Neptune Wallet
+See [RELEASE-0.21.md](RELEASE-0.21.md) for the watch-only fixes, validation results, and build requirements. This source ZIP needs freshly built WASM modules before installation.
 
 A private light wallet for [Neptune Cash](https://neptune.cash) as a Chrome extension, with no node to run and no change to Neptune.
 
-- **Private full scan.** The wallet downloads blocks by height from a compatible neptune-core node, scans them locally, and keeps its own membership proofs. Full-scan requests contain heights, not addresses or keys. Optional Fast restore instead exposes receiver identifiers and coin index sets to the chosen node; its recovery screen explains this before selection.
+- **Private sync.** The wallet downloads blocks by height from any public neptune-core node, scans them locally, and keeps its own membership proofs. The server learns only which heights you asked for. It never sees an address, a key, or which coins are yours.
 - **Fast start.** A new wallet starts at the current tip: no history to download.
 - **Proving on your device, in parallel.** A transaction's ProofCollection is split into independent jobs that run in separate Web Workers, each with its own wasm memory.
-- **Uses Neptune as it is.** Existing JSON-RPC endpoints handle block reading, submission and optional indexed recovery. A WASM compatibility patch and targeted warning cleanup are applied to a vendored copy of neptune-core inside this repo.
+- **Uses Neptune as it is.** Only existing JSON-RPC endpoints (`chain_height`, `wallet_getBlocks`, `wallet_submitTransaction`). The only patch is a small wasm-compatibility diff applied to a vendored copy of neptune-core inside this repo.
 
 > **Status: alpha, not yet compiled.** The code was written against neptune-core's source (commit `cc3fca9`, crates 0.19) but has not been built or run yet. Start with [docs/STATUS.md](docs/STATUS.md), which lists what to verify first. Use testnet before mainnet.
 
@@ -82,6 +80,6 @@ The sync algorithm in `light-core/src/sync.rs` and the claim construction in `li
 
 ## Build on GitHub (nothing to install)
 
-1. Upload this folder to a new private GitHub repository.
-2. Open **Actions → set up a workflow yourself**, paste the contents of `github-workflow.yml`, and commit.
-3. When the run finishes, download **neptune-light-extension** from the run page and load it unpacked in Chrome.
+1. Commit this project to your private GitHub repository, including `.github/workflows/build.yml`.
+2. Open **Actions → build** and run the workflow if it did not start on push.
+3. After all checks and the WASM build pass, download **neptune-light-extension** and load it unpacked in Chrome.

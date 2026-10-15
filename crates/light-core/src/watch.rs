@@ -210,7 +210,7 @@ impl WatchAccount {
         })
     }
 
-    fn index_set(&self, coin: &WatchCoin) -> Option<AbsoluteIndexSet> {
+    pub(crate) fn index_set(&self, coin: &WatchCoin) -> Option<AbsoluteIndexSet> {
         self.receiver_preimage.map(|rp| {
             AbsoluteIndexSet::compute(
                 Tip5::hash(&coin.utxo),
@@ -259,6 +259,14 @@ pub fn scan_block(account: &mut WatchAccount, key: &WatchKey, block: &WatchBlock
             block.height
         );
     }
+    let delta = scan_indexed_block(account, key, block)?;
+    account.scanned_to = block.height;
+    account.cursor_hash = Some(block.hash);
+    Ok(delta)
+}
+
+/// Scan an index-selected block. The caller pins the final cursor separately.
+pub fn scan_indexed_block(account: &mut WatchAccount, key: &WatchKey, block: &WatchBlock) -> Result<WatchDelta> {
     let mut delta = WatchDelta::default();
 
     // Spends first: a coin is never spent in the block that creates it.
@@ -316,8 +324,6 @@ pub fn scan_block(account: &mut WatchAccount, key: &WatchKey, block: &WatchBlock
         delta.received += 1;
     }
 
-    account.scanned_to = block.height;
-    account.cursor_hash = Some(block.hash);
     Ok(delta)
 }
 
@@ -381,5 +387,107 @@ pub fn view(account: &WatchAccount, now_ms: u64) -> WatchView {
         received: account.received().display_lossless(),
         unspent: account.unspent().map(|a| a.display_lossless()),
         coins,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use neptune_consensus::type_scripts::native_currency_amount::NativeCurrencyAmount;
+    use neptune_wallet::twenty_first::math::b_field_element::BFieldElement;
+    use neptune_wallet::utxo_notification::UtxoNotificationPayload;
+
+    use super::*;
+    use crate::keys::{KeyRef, Keys};
+
+    fn d(n: u64) -> Digest {
+        Tip5::hash(&BFieldElement::new(n))
+    }
+
+    #[test]
+    fn watch_sees_receipts_and_with_the_spend_key_spends() {
+        let phrase = Keys::phrase_from_entropy(&[3; 24]).unwrap();
+        let keys = Keys::from_phrase(&phrase, Network::Main).unwrap();
+        for key_ref in [KeyRef::Generation(0), KeyRef::EcHybrid(0)] {
+            let sk = keys.key(key_ref);
+            let vk = sk.to_viewing_key_bech32m(Network::Main).unwrap();
+            let rp = sk.privacy_preimage();
+
+            // A spend key from elsewhere is refused; an address is not a key.
+            assert!(WatchAccount::new(1, "x", &vk, Some(d(1).to_hex().as_str()), 5, Network::Main).is_err());
+            let addr_text = keys.address(key_ref).to_bech32m(Network::Main).unwrap();
+            assert!(WatchKey::parse(&addr_text, Network::Main).is_err());
+
+            let mut with = WatchAccount::new(1, "with", &vk, Some(rp.to_hex().as_str()), 5, Network::Main).unwrap();
+            let mut without = WatchAccount::new(2, "without", &vk, None, 5, Network::Main).unwrap();
+            let key = with.key(Network::Main).unwrap();
+            assert_eq!(key.address().privacy_digest(), rp.hash());
+
+            let address = sk.to_address();
+            let utxo = Utxo::new_native_currency(address.lock_script_hash(), NativeCurrencyAmount::coins(3));
+            let sr = d(7);
+            let anns = vec![address.generate_announcement(UtxoNotificationPayload::new(utxo.clone(), sr))];
+            let record = commit(Tip5::hash(&utxo), sr, address.privacy_digest());
+            let additions = vec![AdditionRecord::new(d(2)), record];
+            let b5 = WatchBlock {
+                height: 5,
+                hash: d(50),
+                prev: d(49),
+                timestamp_ms: 1,
+                announcements: &anns,
+                additions: &additions,
+                first_leaf: 100,
+                spent_sets: &[],
+            };
+            for acc in [&mut with, &mut without] {
+                let delta = scan_block(acc, &key, &b5).unwrap();
+                assert_eq!(delta.received, 1);
+                assert_eq!(acc.coins[0].aocl_index, 101);
+            }
+
+            // Block 6 spends it: only the account with the spend key sees that.
+            let set = AbsoluteIndexSet::compute(Tip5::hash(&utxo), sr, rp, 101);
+            let spent = [set];
+            let b6 = WatchBlock {
+                height: 6,
+                hash: d(60),
+                prev: d(50),
+                timestamp_ms: 2,
+                announcements: &[],
+                additions: &[],
+                first_leaf: 102,
+                spent_sets: &spent,
+            };
+            assert_eq!(scan_block(&mut with, &key, &b6).unwrap().spent, 1);
+            assert_eq!(scan_block(&mut without, &key, &b6).unwrap().spent, 0);
+            assert_eq!(with.coins[0].spent_height, Some(6));
+            assert_eq!(with.unspent(), Some(NativeCurrencyAmount::default()));
+            assert_eq!(without.unspent(), None);
+            assert_eq!(without.received(), NativeCurrencyAmount::coins(3));
+
+            // The index can select nonconsecutive blocks without claiming
+            // that the intervening chain has already been read. Repeated
+            // blocks must not double-count receipts or spends.
+            let mut indexed = WatchAccount::new(3, "indexed", &vk, Some(rp.to_hex().as_str()), 5, Network::Main).unwrap();
+            assert_eq!(scan_indexed_block(&mut indexed, &key, &b5).unwrap().received, 1);
+            assert_eq!(scan_indexed_block(&mut indexed, &key, &b5).unwrap().received, 0);
+            assert_eq!(scan_indexed_block(&mut indexed, &key, &b6).unwrap().spent, 1);
+            assert_eq!(scan_indexed_block(&mut indexed, &key, &b6).unwrap().spent, 0);
+            assert_eq!(indexed.scanned_to, 4);
+            assert_eq!(indexed.cursor_hash, None);
+            assert_eq!(indexed.unspent(), Some(NativeCurrencyAmount::default()));
+
+            // A block that does not extend the cursor is refused.
+            let b7 = WatchBlock {
+                height: 7,
+                hash: d(70),
+                prev: d(1),
+                timestamp_ms: 3,
+                announcements: &[],
+                additions: &[],
+                first_leaf: 102,
+                spent_sets: &[],
+            };
+            assert!(scan_block(&mut with, &key, &b7).is_err());
+        }
     }
 }

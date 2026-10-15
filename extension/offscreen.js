@@ -137,7 +137,6 @@ async function submit(sendId, rawKey) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.target !== 'offscreen') return false;
-  if (_sender?.id !== chrome.runtime.id || _sender.url !== chrome.runtime.getURL('background.js')) return false;
   if (msg.type === 'ping') {
     sendResponse({ sendId: active?.sendId || submitting || null });
     return false;

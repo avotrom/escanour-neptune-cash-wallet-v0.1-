@@ -288,3 +288,104 @@ pub fn overlap(set: &[(u64, u64)], lo: u64, hi: u64) -> u64 {
 pub fn contains(set: &[(u64, u64)], leaf: u64) -> bool {
     overlap(set, leaf, leaf) == 1
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Brute force: which leaves of `range` can `c` take, given `spends`,
+    /// by trying every assignment (tiny inputs only).
+    fn brute(spends: &[(u64, u64)], range: (u64, u64)) -> Vec<u64> {
+        fn assign(spends: &[(u64, u64)], used: &mut Vec<u64>) -> bool {
+            let Some((&(a, b), rest)) = spends.split_first() else {
+                return true;
+            };
+            for l in a..=b {
+                if !used.contains(&l) {
+                    used.push(l);
+                    if assign(rest, used) {
+                        used.pop();
+                        return true;
+                    }
+                    used.pop();
+                }
+            }
+            false
+        }
+        (range.0..=range.1)
+            .filter(|&l| assign(spends, &mut vec![l]))
+            .collect()
+    }
+
+    fn fast(spends: &[(u64, u64)], range: (u64, u64)) -> Vec<u64> {
+        let t = provably_spent(spends).unwrap();
+        (range.0..=range.1).filter(|&l| !contains(&t, l)).collect()
+    }
+
+    #[test]
+    fn tight_pair_excludes_both_leaves() {
+        // Two spends that can only be leaves 3 and 4: both provably spent.
+        let spends = [(3, 4), (3, 4), (0, 9)];
+        assert_eq!(fast(&spends, (0, 9)), brute(&spends, (0, 9)));
+        assert_eq!(fast(&spends, (0, 9)), vec![0, 1, 2, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn lustration_pins_one_leaf() {
+        let spends = [(5, 5), (0, 7)];
+        assert_eq!(fast(&spends, (0, 7)), brute(&spends, (0, 7)));
+    }
+
+    #[test]
+    fn no_spends_means_whole_range() {
+        assert_eq!(fast(&[], (10, 17)).len(), 8);
+    }
+
+    #[test]
+    fn inconsistent_data_is_refused() {
+        // Three spends inside two leaves cannot be real.
+        assert!(provably_spent(&[(1, 2), (1, 2), (2, 2)]).is_err());
+    }
+
+    #[test]
+    fn matches_brute_force_on_many_small_cases() {
+        // Deterministic pseudo-random cases; only consistent ones count.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0;
+        for _ in 0..4000 {
+            let n_leaves = 2 + next() % 10;
+            let n_spends = next() % 7;
+            let spends: Vec<(u64, u64)> = (0..n_spends)
+                .map(|_| {
+                    let a = next() % n_leaves;
+                    let b = a + next() % (n_leaves - a);
+                    (a, b)
+                })
+                .collect();
+            let range = {
+                let a = next() % n_leaves;
+                (a, a + next() % (n_leaves - a))
+            };
+            // Only data a real chain could produce: all spends assignable.
+            let feasible = !brute(&spends, (n_leaves + 100, n_leaves + 100)).is_empty();
+            if !feasible {
+                // Hall's condition fails somewhere: the data must be refused.
+                assert!(provably_spent(&spends).is_err(), "{spends:?}");
+                continue;
+            }
+            assert_eq!(
+                fast(&spends, range),
+                brute(&spends, range),
+                "{spends:?} {range:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 1000);
+    }
+}

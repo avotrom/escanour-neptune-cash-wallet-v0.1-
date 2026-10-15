@@ -1,19 +1,12 @@
 // Popup UI. Holds no secrets except a recovery phrase the user is looking at;
 // every action is a message to the service worker.
 
-import { t, translateText, setLanguage, applyI18n, lang } from './lib/i18n.js';
-import { initParameters, openParameterScreen, parameterScreenChanged, refreshParameters, clearParameters } from './lib/parameters.js';
-import { setAmount, setAmountsHidden, amountsHidden, clearAmountCache } from './lib/privacy.js';
+import { t, setLanguage, applyI18n, lang } from './lib/i18n.js';
+import { contactAddresses, visibleWatch, scanProgress, singleFlight } from './lib/watch-model.js';
 import { readAddressFromFile, readAddressFromImageBlob, cleanAddress } from './lib/qrimport.js';
 
 const $ = (id) => document.getElementById(id);
-let pendingApproval = null;
-function askAuthCode() {
-  if(pendingApproval) return Promise.reject(new Error('Complete the current approval first'));
-  return new Promise(resolve => {pendingApproval=resolve; $('authApprovalCode').value=''; $('authApproval').showModal(); $('authApprovalCode').focus();});
-}
-$('authApproval').addEventListener('close', () => {const code=$('authApproval').returnValue==='approve'?$('authApprovalCode').value.trim():null; $('authApprovalCode').value=''; const resolve=pendingApproval;pendingApproval=null;resolve?.(code);});
-const SCREENS = ['welcome', 'ready', 'setup', 'unlock', 'home', 'settings', 'contacts', 'phrase', 'servers', 'advanced', 'about', 'pcheck', 'tor', 'watch', 'claim', 'archive', 'toolsNetwork','toolsScans','toolsPortfolios','toolsActivity','toolsPayments','toolsNode','toolsBackup','toolsSecurity','toolsAssistant','toolsRestore'];
+const SCREENS = ['welcome', 'ready', 'setup', 'unlock', 'home', 'settings', 'contacts', 'phrase', 'servers', 'advanced', 'about', 'pcheck', 'tor', 'watch', 'claim', 'archive'];
 const PARAMS = new URLSearchParams(location.search);
 const IN_TAB = PARAMS.get('view') === 'tab';
 // The wallet's usual home: Chrome's side panel, full height next to the page.
@@ -37,23 +30,11 @@ let historyCache = [];
 let price = null;
 let serversNet = 'main';
 const addrCache = {}; // kind -> receiving address (one per kind and network)
-let assetsHidden = amountsHidden();
-let lastHomeWatch = [];
-let hiddenWatchIds = [];
-try { localStorage.removeItem('esc.hiddenWatch'); } catch {}
-function applyAssetVisibility() {
-  setAmountsHidden(assetsHidden);
-  $('hideAssets').textContent = translateText(assetsHidden ? 'Show balances' : 'Hide balances');
-  $('hideAssets').setAttribute('aria-pressed', String(assetsHidden));
-}
-$('hideAssets').onclick = () => {
-  assetsHidden = !assetsHidden;
-  localStorage.setItem('esc.hideAssets', String(assetsHidden));
-  applyAssetVisibility();
-};
-applyAssetVisibility();
-
-let contacts = []; // decrypted address book for this network
+let contacts = [];
+let homeWatchCache = [];
+let currentScreen = 'home';
+let watchOrigin = 'home';
+let watchFocus = null; // decrypted address book for this network
 
 if (IN_TAB) document.body.classList.add('in-tab');
 if (IN_PANEL) document.body.classList.add('in-panel');
@@ -66,10 +47,6 @@ async function call(cmd, args) {
     try {
       const r = await chrome.runtime.sendMessage({ target: 'background', cmd, args });
       if (r === undefined) throw new Error('no response');
-      if (!r.ok && r.error==='AUTH_CODE_REQUIRED') {
-        const authCode=await askAuthCode();if(!authCode)throw new Error('Approval cancelled');
-        return call(cmd,{...args,authCode});
-      }
       if (!r.ok) throw new Error(r.error);
       return r.data;
     } catch (e) {
@@ -83,24 +60,7 @@ async function call(cmd, args) {
 // ------------------------------------------------------------- helpers ----
 
 function showScreen(name) {
-  parameterScreenChanged(name);
-  if (['unlock', 'welcome'].includes(name)) {
-    clearParameters(); clearAmountCache();
-    if (currentSheet) closeSheet();
-    revealed = null; contacts = []; historyCache = []; lastHomeWatch = []; hiddenWatchIds = []; lastSummary = null; lastAvail = null; lastSend = null;
-    for (const key of Object.keys(addrCache)) delete addrCache[key];
-    for (const id of ['revealGrid','vkOut','qrBox','addrText','txDetails','homeWatch','watchList','contactList','pickList']) $(id)?.replaceChildren();
-    for (const id of ['vkPw','revealPw']) if($(id)) $(id).value = '';
-    if($('addrText')) delete $('addrText').dataset.addr;
-
-    $('watchForm').reset();
-    $('sendForm').reset();
-    for (const id of ['ctName','ctAddr','ctAddr2','txNoteInput','claimText']) if($(id)) $(id).value='';
-    for (const id of ['balAvail','balExtra','fiatVal','homeWatchProgress']) if($(id)) $(id).textContent='';
-    $('watchFromBlock').hidden = true;
-    for (const b of document.querySelectorAll('#watchFromSeg button')) b.classList.toggle('on', b.dataset.from === 'start');
-    watchFrom = 'start';
-  }
+  currentScreen = name;
   for (const s of SCREENS) $(`v-${s}`).hidden = s !== name;
   $(`v-${name}`).scrollTop = 0;
 }
@@ -283,6 +243,7 @@ async function boot() {
     return runUrlAction();
   }
   if (!app.unlocked) {
+    clearWatchSecrets();
     showScreen('unlock');
     setTimeout(() => $('unlockPw').focus(), 60);
     return;
@@ -315,6 +276,7 @@ function showTab(name) {
     b.setAttribute('aria-selected', String(on));
   }
   for (const p of document.querySelectorAll('#v-home .pane')) p.hidden = p.dataset.pane !== homeTab;
+  $('homeWatchSection').hidden = homeTab === 'act';
   try {
     localStorage.setItem('esc.tab', homeTab);
   } catch {
@@ -324,73 +286,68 @@ function showTab(name) {
 for (const b of document.querySelectorAll('.tabs .tab')) b.onclick = () => showTab(b.dataset.tab);
 showTab(homeTab);
 
-$('goWatch').onclick = () => openSub('watch');
+$('goWatch').onclick = () => openWatch('home');
 $('goPrivacy').onclick = () => $('privacyChip').click();
-$('homeWatchEmpty').onclick = () => openSub('watch');
-$('homeWatchMore').onclick = () => openSub('watch');
+$('homeWatchEmpty').onclick = () => addWatchFromHome();
+$('homeWatchMore').onclick = () => openWatch('home');
+$('homeWatchAdd').onclick = () => addWatchFromHome();
+$('homeContacts').onclick = () => openSub('contacts');
+$('homeWatchSearch').oninput = () => renderHomeWatch(homeWatchCache);
+$('homeShowHidden').onchange = () => renderHomeWatch(homeWatchCache);
+async function addWatchFromHome() { await openWatch('home'); $('watchAddBox').open = true; $('watchKey').focus(); }
 
-/** Watch-only addresses on the home screen: one line each, details one tap away. */
+const amountText = (value, suffix = '') => app?.settings?.hideAssets ? '••••' : `${fmtAmt(value)}${suffix}`;
+const watchModeText = (a) => t(a.mode === 'node' ? 'watch.modeNodeShort' : a.mode === 'fast' ? 'watch.modeFastShort' : 'watch.modePrivateShort');
+function accountStatus(a, height) {
+  if (a.paused) return t('watch.paused');
+  const fast = app?.status?.watchFast;
+  if (fast?.id === a.id) return t('watch.indexProgress', { n: fast.found || 0, a: fast.done || 0, b: fast.total || 0 });
+  const p = scanProgress(a, height);
+  return a.scanned_to < height ? t('watch.scanning', { a: fmtNum(p.at), b: fmtNum(p.end) }) : t('watch.caughtUp', { h: fmtNum(height) });
+}
+function watchProgressBar(a, height) {
+  const progress = document.createElement('progress');
+  progress.className = 'watch-meter'; progress.max = 100;
+  progress.value = scanProgress(a, height).percent;
+  progress.setAttribute('aria-label', accountStatus(a, height));
+  return progress;
+}
 function renderHomeWatch(list) {
-  lastHomeWatch = list;
-  renderHomeWatchProgress();
-  const ul = $('homeWatch');
-  ul.textContent = '';
-  $('homeWatchEmpty').hidden = list.length > 0;
+  homeWatchCache = list;
+  const ul = $('homeWatch'); ul.textContent = '';
+  const shown = visibleWatch(list, $('homeShowHidden').checked, $('homeWatchSearch').value);
+  $('homeWatchCount').textContent = t('watch.count', { n: list.length, h: list.filter((a) => a.hidden).length });
+  $('homeWatchEmpty').hidden = shown.length > 0;
   $('homeWatchMore').hidden = list.length === 0;
-  for (const a of list) {
-
-    const li = document.createElement('li');
-    const btn = document.createElement('button');
-    btn.className = 'hw-row';
-    btn.onclick = () => openSub('watch');
-    const ic = document.createElement('span');
-    ic.className = 'hw-ic';
-    ic.innerHTML = '<svg><use href="#i-eye"/></svg>';
-    const mid = document.createElement('span');
-    mid.className = 'hw-mid';
-    const name = document.createElement('b');
-    name.textContent = a.label || a.key_short;
+  const height = app?.status?.height || 0;
+  for (const a of shown) {
+    const li = document.createElement('li'); li.className = 'watch-preview';
+    li.dataset.paused = String(a.paused); li.dataset.hidden = String(a.hidden);
+    const btn = document.createElement('button'); btn.className = 'hw-row';
+    btn.onclick = () => { watchFocus = a.id; openWatch('home'); };
+    const ic = document.createElement('span'); ic.className = 'hw-ic';
+    ic.textContent = (a.label || 'W').slice(0, 1).toUpperCase();
+    const mid = document.createElement('span'); mid.className = 'hw-mid';
+    const name = document.createElement('b'); name.textContent = a.label || a.key_short;
     const sub = document.createElement('small');
-    const syncing = a.scanned_to < (app?.status?.height ?? a.scanned_to);
-    sub.textContent = syncing
-      ? t('watch.scanning', { a: fmtNum(Math.max(0, a.scanned_to)), b: fmtNum(app.status.height) })
-      : `${a.kind === 'ec-hybrid' ? t('kind.ecHybridShort') : a.kind === 'generation' ? t('kind.generationShort') : 'Viewing'} · ${a.coinCount ?? a.coins.length}`;
+    sub.textContent = `${t(a.kind === 'ec-hybrid' ? 'kind.ecHybridShort' : 'kind.generationShort')} · ${watchModeText(a)}`;
     mid.append(name, sub);
-    if (syncing) {
-      const progress = document.createElement('progress');
-      progress.max = Math.max(1, (app?.status?.height || 0) - a.from_height + 1);
-      progress.value = Math.max(0, a.scanned_to - a.from_height + 1);
-      progress.setAttribute('aria-label', 'Blocks read');
-      mid.append(progress);
-    }
-    const amt = document.createElement('span');
-    amt.className = 'hw-amt';
-    const v = document.createElement('b');
-    setAmount(v,`${fmtAmt(a.unspent ?? a.received)} NPT`);
-    const k = document.createElement('small');
-    k.textContent = a.unspent != null ? t('watch.unspent') : t('watch.received');
-    amt.append(v, k);
-    btn.append(ic, mid, amt);
-    li.append(btn);
-    ul.append(li);
+    const amt = document.createElement('span'); amt.className = 'hw-amt';
+    const value = document.createElement('b'); value.textContent = amountText(a.unspent ?? a.received, ' NPT');
+    const label = document.createElement('small'); label.textContent = t(a.unspent != null ? 'watch.unspent' : 'watch.received');
+    amt.append(value, label); btn.append(ic, mid, amt);
+    const line = document.createElement('small'); line.className = 'watch-cursor'; line.textContent = accountStatus(a, height);
+    if (a.warning) line.textContent += ` · ${t(a.warning)}`;
+    li.append(btn, watchProgressBar(a, height), line); ul.append(li);
   }
 }
-
-function renderHomeWatchProgress() {
-  const st = app?.status || {};
-  const p = $('homeWatchProgress');
-  p.textContent = st.watchError ? `Block reading interrupted: ${st.watchError}. Retrying automatically.`
-    : st.watchBehind ? `Reading blocks ${fmtNum(Math.max(0, st.watchBehind.at))} / ${fmtNum(st.watchBehind.end)}`
-    : lastHomeWatch.length ? 'Following chain updates' : 'Add a viewing key to start following';
-}
+$('hideAssets').onclick = async () => {
+  const saved = await savePref({ hideAssets: !app.settings.hideAssets });
+  if (saved) await refreshHome();
+};
 
 /** One request for everything on the home screen (one decrypted state). */
-let homeRefresh = null;
-function refreshHome() {
-  if(homeRefresh)return homeRefresh;
-  homeRefresh=loadHome().finally(()=>{homeRefresh=null;});return homeRefresh;
-}
-async function loadHome() {
+const refreshHome = singleFlight(async () => {
   let h;
   try {
     h = await call('home');
@@ -399,12 +356,14 @@ async function loadHome() {
     return;
   }
   contacts = h.contacts || [];
-  hiddenWatchIds = h.hiddenWatchIds || [];
+  if (app && h.height != null) app.status = { ...app.status, height: h.height };
+  $('hideAssets').textContent = t(app?.settings?.hideAssets ? 'watch.showAmounts' : 'watch.hideAmounts');
+  $('hideAssets').setAttribute('aria-pressed', String(Boolean(app?.settings?.hideAssets)));
   Object.assign(addrCache, h.addresses || {});
   await Promise.all([renderBalance(h.summary), renderHistory(h.activity), renderAddresses()]);
   renderPrivacy(h.privacy);
   renderHomeWatch(h.watch || []);
-}
+});
 
 /** Actions passed when the popup reopens as a tab (file pickers close popups). */
 function runUrlAction() {
@@ -585,7 +544,7 @@ $('setupGo').onclick = async () => {
   if (replacing && !confirm(t('setup.confirmReplace'))) return;
   // A restore scans the whole chain, so every coin of this seed is found
   // without asking when the wallet was created. A new wallet starts at the tip.
-  const from = setupMode === 'restore' ? { birthday: 0 } : {};
+  const from = setupMode === 'restore' ? { birthday: 1 } : {};
   if (setupMode === 'restore') {
     from.restoreMode = document.querySelector('input[name="restoreMode"]:checked')?.value || 'private';
     if (from.restoreMode === 'node') {
@@ -671,6 +630,13 @@ function renderStatus(st) {
     state = 'bad';
     title = t('status.problem');
     sub = st.error;
+  } else if (st.watchError) {
+    state = 'bad'; title = t('watch.scanError'); sub = st.watchError;
+  } else if (st.watchBehind || st.watchFast) {
+    title = t('watch.reading');
+    const p = st.watchBehind || { at: 0, end: st.height || 0 };
+    sub = st.watchFast ? t('watch.indexShort', { n: st.watchFast.found || 0 }) : `${fmtNum(p.at)} / ${fmtNum(p.end)}`;
+    ratio = p.end ? Math.max(0.04, Math.min(1, p.at / p.end)) : 0;
   } else if (st.height != null && st.tip != null) {
     if (st.height >= st.tip) {
       state = 'ok';
@@ -693,7 +659,7 @@ function renderStatus(st) {
   }
   wrap.dataset.state = state;
   // Calm by default: when all is well, only the network pill's dot says so.
-  wrap.hidden = state === 'ok';
+  wrap.hidden = false;
   $('netBtn').dataset.sync = state;
   $('netBtn').title = `${title} ${heights || sub}`.trim();
   $('statusTitle').textContent = title;
@@ -703,7 +669,6 @@ function renderStatus(st) {
 }
 
 $('statusBtn').onclick = async () => {
-  if(app?.status?.fastFailed) return openSub('toolsRestore');
   if (app?.status?.error === 'NEED_SERVER') return openServers(app.settings.network);
   renderStatus({ ...(app?.status || {}), error: null, serverOk: undefined, height: null });
   try {
@@ -729,11 +694,11 @@ async function renderBalance(given) {
     const shown = k.generation != null && k.ec_hybrid != null
       ? fromUnits(cut8(toUnits(k.generation)) + cut8(toUnits(k.ec_hybrid)))
       : fmtAmt(s.available);
-    setAmount($('balAvail'),shown);
+    $('balAvail').textContent = app?.settings?.hideAssets ? '••••' : shown;
     lastAvail = s.available;
     renderExtra();
     for (const [kind, v] of [['generation', k.generation], ['ec-hybrid', k.ec_hybrid]]) {
-      setAmount($(`kBal-${kind}`),fmtAmt(v));
+      $(`kBal-${kind}`).textContent = amountText(v);
       document.querySelector(`.acard[data-kind="${kind}"]`).classList.toggle('has', Number(v) > 0);
     }
     $('kChangeRow').hidden = true; // change counts for the address that paid
@@ -746,6 +711,7 @@ async function renderBalance(given) {
 function renderExtra() {
   const s = lastSummary;
   if (!s) return;
+  if (app?.settings?.hideAssets) { $('balExtra').textContent = ''; return; }
   // Short pills, never sentences: sync progress lives in the sync line above.
   const pills = [];
   const st = app?.status || {};
@@ -760,13 +726,12 @@ function renderExtra() {
   } else if (Number(s.pending_out) > 0) {
     pills.push(['back', t('pill.returning', { c: fmtAmt(s.pending_out) })]);
   }
-  if (Number(s.timelocked) > 0) pills.push(['money', t('pill.locked', { n: fmtAmt(s.timelocked) })]);
+  if (Number(s.timelocked) > 0) pills.push(['', t('pill.locked', { n: fmtAmt(s.timelocked) })]);
   const box = $('balExtra');
   box.replaceChildren(...pills.map(([kind, text]) => {
     const el = document.createElement('span');
     el.className = `bpill ${kind}`.trim();
-    if(['out','back','money'].includes(kind))setAmount(el,text);else el.textContent=text;
-    if(st.fastFailed && kind==='warn'){el.setAttribute('role','button');el.tabIndex=0;el.onclick=()=>openSub('toolsRestore');el.onkeydown=e=>{if(e.key==='Enter')el.click();};}
+    el.textContent = text;
     return el;
   }));
 }
@@ -908,7 +873,7 @@ function openPrivacy() {
   for (const c of [...p.coins].sort((a, b) => hiddenAmong(a) - hiddenAmong(b))) {
     const li = document.createElement('li');
     const a = document.createElement('b');
-    setAmount(a,`${fmtAmt(c.amount)} NPT`);
+    a.textContent = `${fmtAmt(c.amount)} NPT`;
     const h = document.createElement('span');
     h.textContent = c.exact_possible != null
       ? t('pv.coinExact', { n: fmtNum(hiddenAmong(c)) })
@@ -1052,7 +1017,7 @@ function renderFiat() {
   }
   $('market').hidden = false;
   $('fiat').hidden = false;
-  setAmount($('fiatVal'),`≈ ${fmtMoney(Number(lastSummary.available) * p, cur)}`);
+  $('fiatVal').textContent = app?.settings?.hideAssets ? '••••' : `≈ ${fmtMoney(Number(lastSummary.available) * p, cur)}`;
   $('unitPrice').textContent = t('price.one', { v: fmtMoney(p, cur, unitDigits(p)) });
   $('fiat').title = '';
   const chg = price.change24h;
@@ -1148,11 +1113,11 @@ function txRow(e, i = 0) {
   const amt = document.createElement('span');
   amt.className = 'tx-amt';
   const v = document.createElement('span');
-  setAmount(v,`${kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)}`);
+  v.textContent = app?.settings?.hideAssets ? '••••' : `${kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)}`;
   amt.append(v);
   if (e.fee) {
     const f = document.createElement('small');
-    setAmount(f,t('tx.fee', { n: fmtAmt(e.fee) }));
+    f.textContent = app?.settings?.hideAssets ? '' : t('tx.fee', { n: fmtAmt(e.fee) });
     amt.append(f);
   }
 
@@ -1201,7 +1166,7 @@ $('seeAll').onclick = openHistory;
 
 function showTx(e) {
   $('txTitle').textContent = e.kind === 'received' ? t('tx.received') : e.kind === 'sent' ? t('tx.sent') : t('tx.elsewhere');
-  setAmount($('txAmount'),`${e.kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)} NPT`);
+  $('txAmount').textContent = app?.settings?.hideAssets ? '••••' : `${e.kind === 'received' ? '+' : '−'}${fmtAmt(e.amount)} NPT`;
   const statusText = e.status === 'pending' ? t('tx.waiting') : e.status === 'expired' ? t('tx.expired') : t('tx.confirmed');
   const rows = [
     [t('tx.status'), statusText],
@@ -1222,7 +1187,7 @@ function showTx(e) {
     const dt = document.createElement('dt');
     dt.textContent = k;
     const dd = document.createElement('dd');
-    if(/ NPT$/.test(String(v)))setAmount(dd,v);else dd.textContent=v;
+    dd.textContent = v;
     if (cls) dd.className = cls;
     dl.append(dt, dd);
   }
@@ -1346,7 +1311,7 @@ function updateAvailHint() {
   const s = lastSummary;
   if (!s) return;
   const v = fromKind === 'generation' ? s.by_kind?.generation : fromKind === 'ec-hybrid' ? s.by_kind?.ec_hybrid : s.available;
-  setAmount($('availHint'),t('send.available', { n: fmtAmt(v) }));
+  $('availHint').textContent = t('send.available', { n: fmtAmt(v) });
 }
 
 $('goSend').onclick = openSend;
@@ -1608,7 +1573,7 @@ function renderSendCard(send) {
   }
   card.hidden = false;
   card.dataset.state = send.status;
-  setAmount($('scTitle'),t('banner.sending', { n: send.amount }));
+  $('scTitle').textContent = t('banner.sending', { n: send.amount });
   $('scStep').textContent =
     send.status === 'proving' && send.jobCount ? t('pg.proveShort', { a: send.jobsDone || 0, b: send.jobCount }) : t(STEP_LABEL[send.status] || 'pg.sending');
   $('scBar').style.width = `${Math.round(progressPct(send))}%`;
@@ -1667,7 +1632,7 @@ async function loadContacts() {
 
 function nameFor(address) {
   if (!address) return '';
-  return contacts.find((c) => (c.addresses || [c]).some((a) => a.address === address))?.name || '';
+  return contacts.find((c) => contactAddresses(c).some((a) => a.address === address))?.name || '';
 }
 
 function contactRow(c, onPick) {
@@ -1680,11 +1645,11 @@ function contactRow(c, onPick) {
   const b = document.createElement('b');
   b.textContent = c.name;
   const sm = document.createElement('small');
-  sm.textContent = (c.addresses || [c]).map((a) => shortAddr(a.address, 12, 8)).join(' · ');
+  sm.textContent = contactAddresses(c).length > 1 ? t('ct.twoAddresses') : shortAddr(c.address, 12, 8);
   main.append(b, sm);
   const tag = document.createElement('span');
   tag.className = 'k-tag';
-  tag.textContent = c.addresses?.length > 1 ? 'Generation + Hybrid' : c.kind === 'ec-hybrid' ? t('kind.ecHybridShort') : t('kind.generationShort');
+  tag.textContent = contactAddresses(c).length > 1 ? t('ct.bothKinds') : c.kind === 'ec-hybrid' ? t('kind.ecHybridShort') : t('kind.generationShort');
   li.append(av, main, tag);
   li.onclick = () => onPick(c);
   li.onkeydown = (ev) => ev.key === 'Enter' && onPick(c);
@@ -1715,8 +1680,8 @@ function openContact(c, prefill = '') {
   err('ctErr');
   $('ctTitle').textContent = c ? t('ct.edit') : t('ct.add');
   $('ctName').value = c?.name || '';
-  $('ctAddr').value = c?.address || prefill;
-  $('ctAddr2').value = c?.addresses?.[1]?.address || '';
+  $('ctAddr').value = (c && contactAddresses(c)[0]?.address) || prefill;
+  $('ctAddr2').value = (c && contactAddresses(c)[1]?.address) || '';
   $('ctDelete').hidden = !c;
   checkContactAddr();
   openSheet('contact');
@@ -1726,15 +1691,18 @@ function openContact(c, prefill = '') {
 let ctTimer = null;
 function checkContactAddr() {
   clearTimeout(ctTimer);
-  const text = cleanAddress($('ctAddr').value);
-  if (!text) return ($('ctKind').hidden = true);
   ctTimer = setTimeout(async () => {
-    const info = await call('addressInfo', { text }).catch((e) => ({ valid: false, error: e.message }));
-    if (!info.valid) kindChip($('ctKind'), 'bad', t('send.badAddr'));
-    else kindChip($('ctKind'), info.kind, kindLabel(info.kind));
+    for (const [input, chip] of [['ctAddr', 'ctKind'], ['ctAddr2', 'ctKind2']]) {
+      const text = cleanAddress($(input).value);
+      if (!text) { $(chip).hidden = true; continue; }
+      const info = await call('addressInfo', { text }).catch((e) => ({ valid: false, error: e.message }));
+      if (cleanAddress($(input).value) !== text) continue;
+      kindChip($(chip), info.valid ? info.kind : 'bad', info.valid ? kindLabel(info.kind) : t('send.badAddr'));
+    }
   }, 200);
 }
 $('ctAddr').addEventListener('input', checkContactAddr);
+$('ctAddr2').addEventListener('input', checkContactAddr);
 $('ctPaste').onclick = async () => {
   try {
     $('ctAddr').value = cleanAddress(await navigator.clipboard.readText());
@@ -1749,7 +1717,7 @@ $('ctSave').onclick = async () => {
   const b = $('ctSave');
   busy(b, true);
   try {
-    contacts = await call('saveContact', { id: editing?.id, name: $('ctName').value, address: cleanAddress($('ctAddr').value), address2: cleanAddress($('ctAddr2').value) });
+    contacts = await call('saveContact', { id: editing?.id, name: $('ctName').value, addresses: [cleanAddress($('ctAddr').value), cleanAddress($('ctAddr2').value)] });
     closeSheet();
     renderContacts();
     renderHistory();
@@ -1775,7 +1743,7 @@ function renderPick() {
   const q = $('pickSearch').value.trim().toLowerCase();
   const list = $('pickList');
   list.textContent = '';
-  const found = contacts.flatMap((c) => (c.addresses || [c]).map((a) => ({ ...c, ...a, addresses: undefined }))).filter((c) => !q || c.name.toLowerCase().includes(q) || c.address.includes(q));
+  const found = contacts.filter((c) => !q || c.name.toLowerCase().includes(q) || contactAddresses(c).some((a) => a.address.includes(q)));
   if (!found.length) {
     const li = document.createElement('li');
     li.className = 'empty-card';
@@ -1783,7 +1751,7 @@ function renderPick() {
     list.append(li);
     return;
   }
-  for (const c of found) {
+  for (const c of found.flatMap((c) => contactAddresses(c).map((a) => ({ ...c, ...a, addresses: [a] })))) {
     list.append(
       contactRow(c, (x) => {
         $('sendTo').value = x.address;
@@ -1811,7 +1779,6 @@ async function openSettings() {
   $('setLanguage').value = s.language || 'auto';
   $('setKind').value = s.addressKind || 'generation';
   $('setNotif').checked = s.notifications !== false;
-  $('setNotifDetails').checked = s.notificationDetails === true;
   $('setPrices').checked = s.priceLookup !== false;
   $('setLock').value = String(s.autoLockMinutes || 15);
   if (!$('setLock').value) $('setLock').value = '15';
@@ -1937,10 +1904,9 @@ function refreshOpenScreen() {
   if (refreshTimer) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
-    refreshParameters();
-    if (!$('v-home').hidden) refreshHome();
     if (!$('v-archive').hidden) renderArchive().catch(() => {});
     if (!$('v-watch').hidden) renderWatch().catch(() => {});
+    if (!$('v-home').hidden) refreshHome().catch(() => {});
     if (!$('v-claim').hidden) renderWaiting().catch(() => {});
   }, 1500);
 }
@@ -1958,46 +1924,60 @@ function watchErr(e) {
 }
 
 let watchFrom = 'start';
-$('watchNode').onclick = () => openSub('servers');
-$('watchContacts').onclick = () => openSub('contacts');
-$('watchScanMode').onchange = async () => {
-  try { await savePref({ watchScanMode: $('watchScanMode').value }); }
-  catch (e) { toast(String(e.message || e)); }
-};
+function clearWatchSecrets() {
+  $('watchForm').reset(); watchFrom = 'start';
+  $('watchFromBlock').hidden = true;
+  for (const b of document.querySelectorAll('#watchFromSeg button')) b.classList.toggle('on', b.dataset.from === 'start');
+  $('vkPw').value = ''; $('vkOut').textContent = ''; $('vkOut').hidden = true;
+}
 
-async function openWatch() {
+async function openWatch(origin = currentScreen === 'settings' ? 'settings' : 'home') {
+  watchOrigin = origin;
   showScreen('watch');
-  $('watchScanMode').value = app?.settings?.watchScanMode || 'private';
-  $('vkOut').hidden = true;
-  $('vkOut').textContent = '';
-  $('vkForm').hidden = false;
-  err('vkErr');
+  $('vkOut').hidden = true; $('vkOut').textContent = ''; $('vkPw').value = '';
+  $('vkForm').hidden = false; err('vkErr');
+  const selected = $('watchContact').value;
+  await loadContacts();
+  $('watchContact').replaceChildren(new Option(t('watch.noContact'), ''));
+  for (const contact of contacts) $('watchContact').add(new Option(contact.name, contact.id));
+  $('watchContact').value = selected;
+  renderWatchMode();
   await renderWatch();
-}
-
-async function renderWatch() {
-  let w;
-  try {
-    w = await call('watchList');
-  } catch (e) {
-    err('watchErr', e);
-    return;
+  if (watchFocus != null) {
+    const card = document.querySelector(`[data-watch-id="${watchFocus}"]`);
+    card?.scrollIntoView({ block: 'center' }); card?.focus(); watchFocus = null;
   }
-  hiddenWatchIds = w.hiddenIds || [];
-  const list = $('watchList');
-  list.textContent = '';
-  $('watchEmpty').hidden = w.list.length > 0;
-  if (!w.list.length) $('watchAddBox').open = true;
-  const p = $('watchProgress');
-  p.hidden = !w.behind && !w.error;
-  if (w.error) p.textContent = `Block reading interrupted: ${w.error}. Retrying automatically.`;
-  if (w.behind && !w.error) p.textContent = t('watch.scanning', { a: fmtNum(w.behind.at), b: fmtNum(w.behind.end) });
-  for (const a of w.list) list.append(watchCard(a, w.height));
 }
+$('watchBack').onclick = () => watchOrigin === 'settings' ? openSettings() : boot();
+$('watchShowHidden').onchange = () => renderWatch();
+$('watchRetry').onclick = () => { call('sync').catch((e) => err('watchScanError', e)); };
+$('watchContact').onchange = () => {
+  const contact = contacts.find((c) => c.id === $('watchContact').value);
+  if (contact) $('watchLabel').value = contact.name;
+};
+function renderWatchMode() {
+  const mode = $('watchMode').value;
+  $('watchNodeField').hidden = mode !== 'node';
+  $('watchModeHint').textContent = t(mode === 'private' ? 'watch.privateHint' : mode === 'node' ? 'watch.ownHint' : 'watch.fastHint');
+}
+$('watchMode').onchange = renderWatchMode;
+const renderWatch = singleFlight(async () => {
+  let w;
+  try { w = await call('watchList'); } catch (e) { err('watchScanError', e); return; }
+  const list = $('watchList'); list.textContent = '';
+  const shown = visibleWatch(w.list, $('watchShowHidden').checked);
+  $('watchEmpty').hidden = shown.length > 0;
+  // Rendering progress must never collapse or reset an unfinished form.
+  if (!w.list.length) $('watchAddBox').open = true;
+  const p = $('watchProgress'); p.hidden = !w.behind;
+  if (w.behind) p.textContent = t('watch.scanning', { a: fmtNum(w.behind.at), b: fmtNum(w.behind.end) });
+  err('watchScanError', w.error || ''); $('watchRetry').hidden = !w.error;
+  for (const a of shown) list.append(watchCard(a, w.height));
+});
 
 function watchCard(a, height) {
   const card = document.createElement('article');
-  card.className = 'w-card';
+  card.className = 'w-card'; card.dataset.watchId = a.id; card.tabIndex = -1;
   const head = document.createElement('header');
   const name = document.createElement('b');
   name.textContent = a.label || shortAddr(a.key_short, 10, 4);
@@ -2013,19 +1993,19 @@ function watchCard(a, height) {
     const l = document.createElement('small');
     l.textContent = label;
     const v = document.createElement('b');
-    setAmount(v,value);
+    v.textContent = value;
     if (dim) v.className = 'dim';
     c.append(l, v);
     return c;
   };
-  nums.append(cell(t('watch.received'), `${fmtAmt(a.received)} NPT`));
-  nums.append(a.unspent != null ? cell(t('watch.unspent'), `${fmtAmt(a.unspent)} NPT`) : cell(t('watch.unspent'), '—', true));
+  nums.append(cell(t('watch.received'), amountText(a.received, ' NPT')));
+  nums.append(a.unspent != null ? cell(t('watch.unspent'), amountText(a.unspent, ' NPT')) : cell(t('watch.unspent'), '—', true));
 
   const meta = document.createElement('small');
   meta.className = 'w-meta';
-  meta.textContent = a.scanned_to < height
-    ? t('watch.scanning', { a: fmtNum(Math.max(a.scanned_to, 0)), b: fmtNum(height) })
-    : a.sees_spends ? a.key_short : t('watch.noSpends');
+  meta.textContent = `${accountStatus(a, height)} · ${watchModeText(a)}`;
+  if (a.warning) meta.textContent += ` · ${t(a.warning)}`;
+  if (!a.sees_spends) meta.textContent += ` · ${t('watch.noSpends')}`;
 
   const coins = document.createElement('ul');
   coins.className = 'w-coins';
@@ -2038,7 +2018,7 @@ function watchCard(a, height) {
   for (const c of a.coins.slice(0, 6)) {
     const li = document.createElement('li');
     const amt = document.createElement('b');
-    setAmount(amt,`${fmtAmt(c.amount)} NPT`);
+    amt.textContent = amountText(c.amount, ' NPT');
     const sub = document.createElement('small');
     const bits = [c.received_ms ? fmtDate(c.received_ms) : t('watch.coinBlock', { h: fmtNum(c.received_height) })];
     if (c.timelocked_now && c.release_ms) bits.push(t('watch.coinLocked', { d: new Date(c.release_ms).toLocaleDateString(lang()) }));
@@ -2053,17 +2033,38 @@ function watchCard(a, height) {
   rm.className = 'btn plain danger-text w-rm';
   rm.textContent = t('watch.remove');
   rm.onclick = async () => {
-    if (!confirm(`Stop following ${a.label || a.key_short}?`)) return;
+    if (!rm.dataset.armed) {
+      rm.dataset.armed = '1';
+      rm.textContent = t('watch.removeAgain');
+      setTimeout(() => {
+        delete rm.dataset.armed;
+        rm.textContent = t('watch.remove');
+      }, 3000);
+      return;
+    }
     busy(rm, true);
     try {
       await call('watchRemove', { id: a.id });
       await renderWatch();
+      await refreshHome();
     } catch (e) {
       toast(String(e.message || e));
       busy(rm, false);
     }
   };
-  card.append(head, nums, meta, coins, rm);
+  const controls = document.createElement('div'); controls.className = 'watch-controls';
+  const updateButton = (label, patch) => {
+    const button = document.createElement('button'); button.className = 'chip'; button.textContent = label;
+    button.onclick = async () => {
+      busy(button, true);
+      try { await call('watchUpdate', { id: a.id, ...patch }); await renderWatch(); await refreshHome(); }
+      catch (e) { toast(String(e.message || e)); } finally { busy(button, false); }
+    };
+    return button;
+  };
+  controls.append(updateButton(t(a.paused ? 'watch.resume' : 'watch.pause'), { paused: !a.paused }),
+    updateButton(t(a.hidden ? 'watch.unhide' : 'watch.hide'), { hidden: !a.hidden }));
+  card.append(head, nums, meta, watchProgressBar(a, height), controls, coins, rm);
   return card;
 }
 
@@ -2081,21 +2082,27 @@ $('watchForm').onsubmit = async (ev) => {
   err('watchErr');
   const label = $('watchLabel').value.trim();
   const from = watchFrom === 'block' ? $('watchFromBlock').value : watchFrom;
+  const mode = $('watchMode').value;
   try {
+    if (mode === 'node') {
+      const url = new URL($('watchNodeUrl').value.trim());
+      const granted = await chrome.permissions.request({ origins: [`${url.origin}/*`] });
+      if (!granted) throw new Error(t('watch.nodePermission'));
+    }
     const r = await runJob({
       cmd: 'watchAdd',
-      args: { label, viewingKey: $('watchKey').value.trim(), spendKey: $('watchSpend').value.trim(), viewingKey2: $('watchKey2').value.trim(), spendKey2: $('watchSpend2').value.trim(), from },
+      args: { label, viewingKey: $('watchKey').value.trim(), spendKey: $('watchSpend').value.trim(), from, mode, nodeUrl: $('watchNodeUrl').value.trim(), contactId: $('watchContact').value },
       btn: $('watchGo'), cancelBtn: $('watchCancel'), line: $('watchWait'),
     });
     if (r.cancelled && !r.late) return; // the form keeps what was typed: try again
     toast(t('watch.added', { l: label || t('watch.title') }));
-    $('watchKey').value = '';
-    $('watchSpend').value = '';
-    $('watchKey2').value = '';
-    $('watchSpend2').value = '';
+    $('watchForm').reset();
+    watchFrom = 'start';
+    for (const x of document.querySelectorAll('#watchFromSeg button')) x.classList.toggle('on', x.dataset.from === 'start');
+    $('watchFromBlock').hidden = true; renderWatchMode();
     $('watchWait').hidden = true;
     $('watchAddBox').open = false;
-    await renderWatch();
+    await renderWatch(); await refreshHome();
   } catch (e) {
     err('watchErr', watchErr(e));
   }
@@ -2203,7 +2210,7 @@ async function renderWaiting() {
     const li = document.createElement('li');
     const txt = document.createElement('span');
     const b = document.createElement('b');
-    setAmount(b,`${fmtAmt(c.amount)} NPT`);
+    b.textContent = `${fmtAmt(c.amount)} NPT`;
     const sm = document.createElement('small');
     sm.textContent = c.release_ms ? t('claim.lock', { d: new Date(c.release_ms).toLocaleDateString(lang()) }) : t('claim.noLock');
     txt.append(b, sm);
@@ -2238,7 +2245,7 @@ $('claimRead').onclick = async () => {
   try {
     const c = await call('claimCheck', { text });
     claimShown = text;
-    setAmount($('claimAmount'),`${fmtAmt(c.amount)} NPT`);
+    $('claimAmount').textContent = `${fmtAmt(c.amount)} NPT`;
     $('claimLock').textContent = c.release_ms ? t('claim.lock', { d: new Date(c.release_ms).toLocaleDateString(lang()) }) : t('claim.noLock');
     $('claimTo').textContent = t('claim.to', { k: c.key_kind === 'change' ? t('kind.change') : kindLabel(c.key_kind) });
     const st = { new: t('claim.statusNew'), waiting: t('claim.statusWaiting'), owned: t('claim.statusOwned') }[c.status] || '';
@@ -2452,9 +2459,9 @@ function renderTor(tor) {
       NO_TOR: t('tor.errNoTor', { p: torInfo.port || app.settings.torPort }),
       NOT_TOR: t('tor.errNotTor'),
       OTHER_PROXY: t('tor.errOther'),
-      NO_PERMISSION: 'Reload the updated extension and accept its proxy permission.',
-      POLICY: 'Chrome policy controls the proxy. Your administrator must allow proxy changes.',
-      PROXY_FAILED: 'Chrome could not apply the proxy. Check browser policy and other proxy extensions.',
+      NO_PERMISSION: t('tor.errPermission'),
+      POLICY: t('tor.errPolicy'),
+      PROXY_ERROR: t('tor.errProxy'),
     }[torInfo.error] || t('tor.errNoTor', { p: torInfo.port || app.settings.torPort });
   }
   $('torHint').textContent = hint;
@@ -2495,16 +2502,7 @@ function renderTor(tor) {
 
 $('setTor').onchange = async () => {
   const want = $('setTor').checked;
-  if (want) {
-    // Proxy is a required install-time permission in Chrome.
-    const granted = await chrome.permissions.contains({ permissions: ['proxy'] }).catch(() => false);
-    if (!granted) {
-      $('setTor').checked = false;
-      toast('Reload the updated extension and accept its proxy permission, then enable Tor.');
-      return;
-    }
-    renderTor({ state: 'connecting', port: Number($('setTorPort').value) });
-  }
+  if (want) renderTor({ state: 'connecting', port: Number($('setTorPort').value) });
   await savePref({ tor: want, torPort: Number($('setTorPort').value) });
   try {
     renderTor(await call('torStatus'));
@@ -2748,7 +2746,7 @@ for (const b of document.querySelectorAll('[data-go]')) b.onclick = () => openSu
 async function openServers(net) {
   if (!app?.settings) app = await call('state');
   serversNet = net || app.settings.network;
-
+  if (serversNet === 'testnet-mock') serversNet = 'testnet';
   fillServers();
   showScreen('servers');
 }
@@ -2772,12 +2770,11 @@ for (const b of document.querySelectorAll('#srvNet .seg-btn')) {
 }
 
 function openSub(name) {
-  if(name.startsWith('tools')) return openParameterScreen(name);
   const s = app.settings;
   if (name === 'servers') return openServers(s.network);
   if (name === 'pcheck') return openPcheck();
   if (name === 'tor') return openTor('settings');
-  if (name === 'watch') return openWatch();
+  if (name === 'watch') return openWatch(currentScreen === 'settings' ? 'settings' : 'home');
   if (name === 'claim') return openClaim();
   if (name === 'archive') return openArchive();
   if (name === 'contacts') {
@@ -2879,8 +2876,7 @@ async function showServerChecks(url) {
       const want = serversNet === 'main' ? 'main' : 'testnet';
       add(info.network.startsWith(want) ? 'ok' : 'bad', t('node.net', { n: info.network }));
     }
-    add(info.fastRestore===true?'ok':'info', info.fastRestore===true?t('node.fastYes'):info.fastRestore===false?t('node.fastNo'):translateText('Fast restore support is not confirmed.'));
-    for(const capability of Object.values(info.fastCapabilities||{}))if(capability.error)add('info',capability.error);
+    add(info.fastRestore ? 'ok' : 'info', info.fastRestore ? t('node.fastYes') : t('node.fastNo'));
     add('info', t('node.provingFull'));
     return info;
   } catch (e) {
@@ -2997,7 +2993,6 @@ document.addEventListener('keydown', (e) => e.key === 'Escape' && closeSheet());
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.target !== 'popup') return;
-  if (msg.type==='locked') { if($('authApproval').open)$('authApproval').close('cancel'); boot().catch(()=>{}); return; }
   if (msg.type === 'tor') {
     if (app) app.tor = msg.tor;
     renderTor(msg.tor);
@@ -3007,7 +3002,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'status') {
     if (msg.network && app?.settings && msg.network !== app.settings.network) return;
     if (app) app.status = msg.status;
-    if (!$('v-home').hidden) { renderStatus(msg.status); renderHomeWatchProgress(); }
+    if (!$('v-home').hidden) renderHomeWatch(homeWatchCache);
+    if (!$('v-home').hidden) renderStatus(msg.status);
     if (!$('v-home').hidden) {
       renderExtra();
       // Refresh the numbers once a sync run ends with new blocks, not on every tip check.
@@ -3023,7 +3019,12 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'job') jobHandlers.get(msg.jobId)?.(msg);
   // A wallet was created or restored in the setup tab: the side panel follows.
   if (msg.type === 'walletChanged' && !IN_TAB) boot().catch(() => {});
-  if (msg.type === 'watch' && !$('v-home').hidden) refreshHome();
+  if (msg.type === 'watch' && (!msg.network || msg.network === app?.settings?.network)) {
+    if (!$('v-home').hidden) refreshHome();
+    if (!$('v-watch').hidden) renderWatch();
+  }
+  if (msg.type === 'locked') { clearWatchSecrets(); boot().catch(() => {}); }
+  if (msg.type === 'contacts') { loadContacts().then(() => { if (!$('v-contacts').hidden) renderContacts(); }); }
   if (msg.type === 'send') {
     if (msg.send.network && app?.settings && msg.send.network !== app.settings.network) return;
     renderSendCard(msg.send);
@@ -3037,17 +3038,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-initParameters({call,showScreen,toast,locked:()=>boot(),download:saveText,formatAmount:fmtAmt,openServers:()=>openSub('servers'),restoreAnother:()=>startSetup('restore',true)});
 boot().catch((e) => {
   showScreen('welcome');
   toast(String(e.message || e));
 });
-
-// Only real interaction refreshes auto-lock; timer-driven reads never do.
-let lastInteractionPing = 0;
-for (const type of ['pointerdown','keydown']) document.addEventListener(type, event => {
-  if (!event.isTrusted || Date.now()-lastInteractionPing < 30000) return;
-  lastInteractionPing = Date.now(); call('touch').catch(() => {});
-}, {passive:true});
-
-$('setNotifDetails').onchange = () => savePref({notificationDetails:$('setNotifDetails').checked});
